@@ -1,0 +1,379 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+import os
+import shutil
+from datetime import datetime
+import glob
+
+def iniciando_navegacion():
+    options = Options()
+    
+    # Configurar opciones de descarga - IMPORTANTE
+    download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BCV_Downloads")
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+    
+    options.add_experimental_option("prefs", {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,  # Desactiva el diálogo de descarga
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,  # Desactiva safebrowsing para evitar advertencias
+        "profile.default_content_setting_values.automatic_downloads": 1  # Permite descargas automáticas
+    })
+    
+    # Otras opciones para evitar detección
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("--start-maximized")
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
+
+def renombrar_y_mover_archivo(download_dir, destino_dir):
+    """
+    Renombra el archivo descargado con la fecha actual y lo mueve a la carpeta destino
+    """
+    # Obtener fecha actual en formato DDMMYYYY
+    fecha_actual = datetime.now().strftime("%d%m%Y")
+    
+    # Nombre nuevo del archivo según especificación
+    nombre_nuevo = f"Tasas+{fecha_actual}.xlsx"
+    
+    print(f"\n{'='*60}")
+    print("PASO 5: RENOMBRANDO Y MOVIENDO ARCHIVO")
+    print(f"{'='*60}")
+    
+    # Esperar a que el archivo se descargue completamente
+    print("Esperando a que se complete la descarga...")
+    time.sleep(10)  # Dar tiempo suficiente para la descarga
+    
+    # Buscar archivos Excel en la carpeta de descargas
+    archivos_excel = []
+    
+    # Buscar en la carpeta de descargas configurada
+    patrones = ['*.xls', '*.xlsx', '*.XLS', '*.XLSX']
+    
+    for patron in patrones:
+        archivos_excel.extend(glob.glob(os.path.join(download_dir, patron)))
+    
+    # Si no hay archivos en la carpeta específica, buscar en Downloads general
+    if not archivos_excel:
+        downloads_general = os.path.join(os.path.expanduser("~"), "Downloads")
+        for patron in patrones:
+            archivos_excel.extend(glob.glob(os.path.join(downloads_general, patron)))
+    
+    if not archivos_excel:
+        print("ERROR: No se encontraron archivos Excel descargados")
+        return None
+    
+    # Ordenar por fecha de modificación (el más reciente primero)
+    archivos_excel.sort(key=os.path.getmtime, reverse=True)
+    
+    # Tomar el archivo más reciente
+    archivo_descargado = archivos_excel[0]
+    nombre_original = os.path.basename(archivo_descargado)
+    
+    print(f"Archivo original encontrado: {nombre_original}")
+    print(f"Modificado: {datetime.fromtimestamp(os.path.getmtime(archivo_descargado))}")
+    
+    # Verificar que la carpeta destino exista
+    if not os.path.exists(destino_dir):
+        print(f"Creando carpeta destino: {destino_dir}")
+        os.makedirs(destino_dir, exist_ok=True)
+    
+    # Ruta completa del nuevo archivo
+    ruta_nueva = os.path.join(destino_dir, nombre_nuevo)
+    
+    # Verificar si ya existe un archivo con ese nombre
+    contador = 1
+    ruta_final = ruta_nueva
+    while os.path.exists(ruta_final):
+        nombre_base = f"Tasas+{fecha_actual}"
+        extension = ".xlsx"
+        ruta_final = os.path.join(destino_dir, f"{nombre_base}_{contador}{extension}")
+        contador += 1
+    
+    try:
+        # Copiar y renombrar el archivo
+        shutil.copy2(archivo_descargado, ruta_final)
+        print(f"✓ Archivo copiado y renombrado exitosamente")
+        print(f"  De: {archivo_descargado}")
+        print(f"  A: {ruta_final}")
+        
+        # Opcional: eliminar el archivo original si se desea
+        # os.remove(archivo_descargado)
+        # print(f"  Archivo original eliminado")
+        
+        # Verificar que el archivo se copió correctamente
+        if os.path.exists(ruta_final):
+            tamaño = os.path.getsize(ruta_final)
+            print(f"  Tamaño del archivo: {tamaño:,} bytes")
+            return ruta_final
+        else:
+            print("ERROR: El archivo no se copió correctamente")
+            return None
+            
+    except Exception as e:
+        print(f"ERROR al copiar/renombrar el archivo: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def main():
+    driver = iniciando_navegacion()
+    download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BCV_Downloads")
+    
+    # Carpeta destino según especificación
+    destino_dir = r"C:\Users\HP\Documents\PERSONAL RS"
+    
+    try:
+        # Paso 1: Acceder directamente a la página de tipo de cambio SMC
+        print("Paso 1: Navegando directamente a la página de tipo de cambio...")
+        tipo_cambio_url = "https://www.bcv.org.ve/estadisticas/tipo-cambio-de-referencia-smc"
+        driver.get(tipo_cambio_url)
+        
+        wait = WebDriverWait(driver, 30)
+        
+        # Esperar a que la página cargue completamente
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        print(f"Paso 2: Página cargada correctamente: {driver.current_url}")
+        
+        # Dar tiempo extra para carga completa
+        time.sleep(3)
+        
+        # Paso 3: Buscar específicamente la estructura basada en la imagen
+        print("Paso 3: Buscando estructura de archivos XLS...")
+        
+        # Estrategia específica para la estructura del BCV
+        # Primero intentamos encontrar la sección más reciente (2026, Trimestre I)
+        
+        # Opción 1: Buscar por el año más reciente
+        try:
+            print("Intentando localizar por año 2026...")
+            # Buscar elementos que contengan "2026" y luego buscar el botón XLS asociado
+            elementos_2026 = driver.find_elements(By.XPATH, "//*[contains(text(), '2026')]")
+            
+            if elementos_2026:
+                print(f"Encontrados {len(elementos_2026)} elementos con '2026'")
+                
+                for elemento in elementos_2026[:3]:  # Revisar los primeros elementos
+                    # Buscar el botón XLS más cercano a este elemento
+                    try:
+                        # Buscar el siguiente botón XLS después del elemento
+                        boton_xls = elemento.find_element(By.XPATH, "./following::*[contains(text(), 'XLS')][1]")
+                        
+                        if boton_xls and boton_xls.is_displayed():
+                            print("¡Encontrado botón XLS asociado a 2026!")
+                            
+                            # Scroll para hacerlo visible
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", boton_xls)
+                            time.sleep(2)
+                            
+                            # Hacer clic con JavaScript para evitar problemas
+                            print("Haciendo clic en el botón XLS...")
+                            driver.execute_script("arguments[0].click();", boton_xls)
+                            print("¡Descarga iniciada!")
+                            
+                            # Esperar a que comience la descarga
+                            time.sleep(5)
+                            
+                            # Verificar si hay algún popup o confirmación
+                            try:
+                                alert = driver.switch_to.alert
+                                alert.accept()
+                                print("Popup de confirmación aceptado")
+                            except:
+                                pass
+                            
+                            break
+                    except Exception as inner_e:
+                        continue
+                        
+        except Exception as e:
+            print(f"No se pudo localizar por año 2026: {e}")
+        
+        # Opción 2: Buscar todos los botones XLS y seleccionar el primero
+        descarga_iniciada = False
+        if not descarga_iniciada:
+            try:
+                print("Intentando Opción 2: Buscar todos los botones XLS...")
+                
+                # Buscar todos los elementos que contengan XLS
+                todos_xls = driver.find_elements(By.XPATH, "//a[contains(text(), 'XLS')] | //button[contains(text(), 'XLS')] | //span[contains(text(), 'XLS')] | //div[contains(text(), 'XLS')]")
+                
+                if todos_xls:
+                    print(f"Encontrados {len(todos_xls)} elementos con texto XLS")
+                    
+                    # Filtrar elementos visibles y clickeables
+                    elementos_clickeables = []
+                    for elemento in todos_xls:
+                        if elemento.is_displayed() and elemento.is_enabled():
+                            elementos_clickeables.append(elemento)
+                    
+                    if elementos_clickeables:
+                        primer_xls = elementos_clickeables[0]
+                        print(f"Seleccionando el primer elemento XLS visible de {len(elementos_clickeables)} encontrados")
+                        
+                        # Obtener información del elemento
+                        print(f"Elemento: {primer_xls.tag_name}, Texto: {primer_xls.text}")
+                        
+                        # Scroll y clic
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", primer_xls)
+                        time.sleep(2)
+                        
+                        # Intentar diferentes métodos de clic
+                        try:
+                            print("Intentando clic normal...")
+                            primer_xls.click()
+                            descarga_iniciada = True
+                        except:
+                            print("Intentando clic con JavaScript...")
+                            driver.execute_script("arguments[0].click();", primer_xls)
+                            descarga_iniciada = True
+                        
+                        print("¡Descarga iniciada!")
+                        time.sleep(5)
+                        
+                    else:
+                        print("No se encontraron elementos XLS clickeables")
+                else:
+                    print("No se encontraron elementos con texto XLS")
+                    
+            except Exception as e2:
+                print(f"Error en Opción 2: {e2}")
+        
+        # Opción 3: Buscar por enlaces de descarga
+        if not descarga_iniciada:
+            try:
+                print("Intentando Opción 3: Buscar enlaces de descarga...")
+                
+                # Buscar enlaces que puedan contener archivos Excel
+                enlaces = driver.find_elements(By.XPATH, "//a[contains(@href, '.xls') or contains(@href, '.xlsx') or contains(@href, 'download') or contains(@href, 'Download')]")
+                
+                if enlaces:
+                    print(f"Encontrados {len(enlaces)} enlaces de posible descarga")
+                    
+                    for i, enlace in enumerate(enlaces[:5]):  # Revisar primeros 5 enlaces
+                        if enlace.is_displayed():
+                            href = enlace.get_attribute('href')
+                            print(f"Enlace {i+1}: {href[:50]}...")
+                            
+                            # Si parece un enlace de archivo Excel
+                            if '.xls' in href.lower() or 'download' in href.lower():
+                                print("Este parece un enlace de descarga, haciendo clic...")
+                                
+                                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", enlace)
+                                time.sleep(1)
+                                
+                                # Guardar la URL para abrir en nueva pestaña si es necesario
+                                url_descarga = href
+                                print(f"URL de descarga: {url_descarga}")
+                                
+                                # Abrir en nueva pestaña
+                                driver.execute_script(f"window.open('{url_descarga}', '_blank');")
+                                print("Archivo abierto en nueva pestaña")
+                                descarga_iniciada = True
+                                time.sleep(5)
+                                break
+                                
+                else:
+                    print("No se encontraron enlaces de descarga")
+                    
+            except Exception as e3:
+                print(f"Error en Opción 3: {e3}")
+        
+        # Paso 4: Verificar si se descargó el archivo
+        print("\n" + "="*50)
+        print("Paso 4: Verificando descarga...")
+        time.sleep(8)  # Dar más tiempo para la descarga
+        
+        # Listar archivos en la carpeta de descargas
+        if os.path.exists(download_dir):
+            archivos = os.listdir(download_dir)
+            if archivos:
+                print(f"Archivos encontrados en {download_dir}:")
+                for archivo in archivos:
+                    print(f"  - {archivo}")
+            else:
+                print(f"No se encontraron archivos en {download_dir}")
+        else:
+            print(f"La carpeta {download_dir} no existe")
+        
+        # También verificar la carpeta de descargas por defecto
+        downloads_default = os.path.join(os.path.expanduser("~"), "Downloads")
+        archivos_recientes = []
+        
+        try:
+            archivos_default = os.listdir(downloads_default)
+            for archivo in archivos_default:
+                if '.xls' in archivo.lower() or '.xlsx' in archivo.lower():
+                    archivos_recientes.append(archivo)
+            
+            if archivos_recientes:
+                print(f"\nArchivos Excel encontrados en Descargas por defecto:")
+                for archivo in archivos_recientes[-3:]:  # Mostrar los 3 más recientes
+                    print(f"  - {archivo}")
+        except:
+            pass
+        
+        print("="*50)
+        
+        # Paso 5: Renombrar y mover el archivo descargado
+        if descarga_iniciada:
+            archivo_renombrado = renombrar_y_mover_archivo(download_dir, destino_dir)
+            
+            if archivo_renombrado:
+                print(f"\n✓ PROCESO COMPLETADO CON ÉXITO")
+                print(f"  Archivo guardado en: {archivo_renombrado}")
+                
+                # Verificar contenido de la carpeta destino
+                print(f"\nContenido actual de la carpeta destino:")
+                if os.path.exists(destino_dir):
+                    archivos_destino = os.listdir(destino_dir)
+                    for archivo in sorted(archivos_destino)[-5:]:  # Mostrar últimos 5 archivos
+                        print(f"  - {archivo}")
+            else:
+                print(f"\n✗ No se pudo renombrar/mover el archivo")
+        
+    except Exception as e:
+        print(f"Error general durante la navegación: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Capturar screenshot
+        try:
+            screenshot_path = os.path.join(download_dir, "error_bcv.png")
+            driver.save_screenshot(screenshot_path)
+            print(f"Captura de pantalla guardada en: {screenshot_path}")
+        except:
+            print("No se pudo guardar captura de pantalla")
+        
+    finally:
+        print("\n" + "="*60)
+        print("Proceso completado.")
+        print(f"Fecha actual: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        print(f"Carpeta destino configurada: {destino_dir}")
+        print("="*60)
+        
+        print(f"\nEl navegador permanecerá abierto para inspección.")
+        print(f"Presiona Ctrl+C en la terminal para cerrar el navegador.")
+        
+        # Mantener el navegador abierto
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nCerrando navegador...")
+            driver.quit()
+
+if __name__ == '__main__':
+    main()
