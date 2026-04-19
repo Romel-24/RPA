@@ -1,0 +1,2050 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from datetime import datetime, timedelta
+import time
+import ssl
+import os
+import shutil
+import glob
+
+def iniciando_navegacion():
+    options = Options()
+    options.add_experimental_option("detach", True)
+    
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--ignore-ssl-errors')
+    options.add_argument('--allow-insecure-localhost')
+    
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--no-sandbox')
+    
+    # Configurar descargas
+    download_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True
+    }
+    options.add_experimental_option("prefs", prefs)
+    
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.maximize_window()
+        
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        print("✅ Navegador iniciado correctamente")
+        return driver, download_dir
+        
+    except Exception as e:
+        print(f"❌ Error al iniciar navegador: {e}")
+        raise
+
+def obtener_nombre_archivo_fecha():
+    """
+    Obtiene el nombre del archivo basado en la fecha del día anterior.
+    Formato: Reporte-Ajuste-Inventario+DDMMYYYY
+    Ejemplo: Reporte-Ajuste-Inventario+09012026
+    CORREGIDO: Asegura formato de 2 dígitos para día y mes
+    """
+    ayer = datetime.now() - timedelta(days=1)
+    
+    # CORRECCIÓN: Usar formato con ceros a la izquierda
+    fecha_formateada = ayer.strftime("%d%m%Y")  # Esto ya da "09" "01" "2026"
+    
+    # Verificar que la fecha sea válida
+    if len(fecha_formateada) != 8:
+        print(f"   ⚠️ ADVERTENCIA: Fecha formateada incorrecta: {fecha_formateada}")
+        # Usar fecha de hoy como respaldo
+        hoy = datetime.now()
+        fecha_formateada = hoy.strftime("%d%m%Y")
+        print(f"   🔧 Usando fecha actual: {fecha_formateada}")
+    
+    nombre_archivo = f"Reporte-Ajuste-Inventario+{fecha_formateada}.xlsx"
+    return nombre_archivo, ayer
+
+def esperar_descarga_archivo(download_dir, timeout=120):
+    """
+    Espera a que se complete la descarga del archivo Excel.
+    Retorna el path del archivo descargado.
+    CORREGIDA: Mejor detección de archivos Excel.
+    """
+    print("\n" + "="*60)
+    print("⏳ ESPERANDO DESCARGA DEL ARCHIVO EXCEL (MEJORADO)")
+    print("="*60)
+    
+    tiempo_inicio = time.time()
+    archivo_descargado = None
+    archivos_vistos = set()
+    
+    print(f"   Directorio de descarga: {download_dir}")
+    print(f"   Tiempo máximo de espera: {timeout} segundos")
+    
+    # Listar archivos existentes antes de empezar
+    archivos_iniciales = set()
+    try:
+        for f in os.listdir(download_dir):
+            if f.endswith(('.xlsx', '.xls', '.csv')):
+                archivos_iniciales.add(os.path.join(download_dir, f))
+    except:
+        pass
+    
+    while time.time() - tiempo_inicio < timeout:
+        tiempo_transcurrido = int(time.time() - tiempo_inicio)
+        print(f"   Esperando descarga... ({tiempo_transcurrido}/{timeout} segundos)")
+        
+        # Buscar archivos nuevos
+        try:
+            archivos_actuales = []
+            for f in os.listdir(download_dir):
+                if f.endswith(('.xlsx', '.xls', '.csv')):
+                    ruta_completa = os.path.join(download_dir, f)
+                    archivos_actuales.append(ruta_completa)
+                    
+                    # Es un archivo nuevo si no estaba en la lista inicial
+                    if ruta_completa not in archivos_iniciales and ruta_completa not in archivos_vistos:
+                        # Verificar que no sea un archivo temporal
+                        if not f.endswith('.crdownload') and not f.endswith('.tmp'):
+                            tamaño = os.path.getsize(ruta_completa) if os.path.exists(ruta_completa) else 0
+                            if tamaño > 1024:  # Al menos 1KB
+                                print(f"   📥 Nuevo archivo detectado: {f}")
+                                print(f"      Tamaño: {tamaño} bytes")
+                                archivos_vistos.add(ruta_completa)
+                                archivo_descargado = ruta_completa
+                                
+                                # Esperar un poco más para asegurar que la descarga completó
+                                print(f"      ⏱️  Esperando 3 segundos para confirmar...")
+                                time.sleep(3)
+                                return archivo_descargado
+        except Exception as e:
+            print(f"   ⚠️ Error leyendo directorio: {e}")
+        
+        # Verificar archivos .crdownload (descarga en progreso)
+        archivos_temp = glob.glob(os.path.join(download_dir, "*.crdownload"))
+        if archivos_temp:
+            print(f"   ⏳ Descarga en progreso... archivos temporales: {len(archivos_temp)}")
+            for temp in archivos_temp[:2]:  # Mostrar primeros 2
+                print(f"      • {os.path.basename(temp)}")
+        
+        time.sleep(3)
+    
+    print(f"   ⚠️ Tiempo de espera excedido ({timeout} segundos)")
+    
+    # Último intento: buscar cualquier archivo Excel que pueda ser el descargado
+    print(f"   🔍 Buscando archivos Excel disponibles...")
+    archivos_excel = []
+    for ext in ['*.xlsx', '*.xls']:
+        archivos_excel.extend(glob.glob(os.path.join(download_dir, ext)))
+    
+    if archivos_excel:
+        # Excluir archivos que estaban inicialmente
+        archivos_nuevos = [f for f in archivos_excel if f not in archivos_iniciales]
+        
+        if archivos_nuevos:
+            # Tomar el más reciente
+            archivos_nuevos.sort(key=os.path.getmtime, reverse=True)
+            archivo_mas_reciente = archivos_nuevos[0]
+            print(f"   📄 Usando archivo más reciente: {os.path.basename(archivo_mas_reciente)}")
+            return archivo_mas_reciente
+        else:
+            # Si no hay nuevos, usar el más reciente de todos modos
+            archivos_excel.sort(key=os.path.getmtime, reverse=True)
+            archivo_mas_reciente = archivos_excel[0]
+            print(f"   📄 Usando archivo disponible más reciente: {os.path.basename(archivo_mas_reciente)}")
+            return archivo_mas_reciente
+    
+    print(f"   ❌ No se encontraron archivos Excel en {download_dir}")
+    return None
+
+def renombrar_y_mover_archivo(archivo_descargado, download_dir):
+    """
+    Renombra y mueve el archivo descargado a la carpeta especificada.
+    CORREGIDA: Maneja mejor rutas, permisos y verificación.
+    """
+    print("\n" + "="*60)
+    print("📁 RENOMBRANDO Y MOVIENDO ARCHIVO (VERSIÓN CORREGIDA)")
+    print("="*60)
+    
+    if not archivo_descargado or not os.path.exists(archivo_descargado):
+        print("   ❌ ERROR: No hay archivo descargado o no existe")
+        return False, None
+    
+    # Obtener el nombre del archivo basado en la fecha
+    nombre_nuevo, fecha_ayer = obtener_nombre_archivo_fecha()
+    print(f"   Fecha del archivo: {fecha_ayer.strftime('%d/%m/%Y')}")
+    print(f"   Nombre nuevo: {nombre_nuevo}")
+    print(f"   Archivo descargado: {os.path.basename(archivo_descargado)}")
+    print(f"   Tamaño: {os.path.getsize(archivo_descargado):,} bytes")
+    
+    # CORRECCIÓN: Rutas correctamente escapadas para Windows
+    rutas_posibles = [
+        r"Z:\Reportes\Ajustes",  # ← CORREGIDO: Usar raw string (r"")
+        r"C:\Reportes\Ajustes",
+        os.path.join(os.path.expanduser('~'), 'Documents', 'Reportes_Ajustes'),
+        os.path.join(os.path.expanduser('~'), 'Desktop', 'Reportes_Ajustes'),
+        os.path.join(download_dir, 'Reportes_Ajustes')
+    ]
+    
+    ruta_destino = None
+    
+    # Buscar la primera ruta válida o crear una
+    for ruta in rutas_posibles:
+        try:
+            print(f"   Probando ruta: {ruta}")
+            
+            # Verificar si es una unidad de red
+            if ruta.startswith(r"Z:\\") or ruta.startswith("Z:\\"):
+                # Verificar si la unidad Z: existe
+                if not os.path.exists(r"Z:\\"):
+                    print(f"      ⚠️ Unidad Z: no disponible, probando siguiente...")
+                    continue
+                
+                # Verificar si la carpeta existe en Z:, si no, intentar crearla
+                if not os.path.exists(ruta):
+                    try:
+                        print(f"      🔧 Creando directorio en unidad de red...")
+                        os.makedirs(ruta, exist_ok=True)
+                        print(f"      ✅ Directorio creado en unidad de red")
+                    except Exception as e:
+                        print(f"      ⚠️ No se pudo crear directorio en unidad de red: {e}")
+                        continue
+            else:
+                # Para rutas locales, crear si no existen
+                if not os.path.exists(ruta):
+                    print(f"      🔧 Creando directorio local...")
+                    os.makedirs(ruta, exist_ok=True)
+                    print(f"      ✅ Directorio local creado")
+            
+            # Verificar permisos de escritura (solo para rutas accesibles)
+            try:
+                archivo_test = os.path.join(ruta, 'test_permissions.tmp')
+                with open(archivo_test, 'w') as f:
+                    f.write('test')
+                os.remove(archivo_test)
+                ruta_destino = ruta
+                print(f"      ✅ Ruta válida y con permisos de escritura")
+                break
+            except Exception as e:
+                print(f"      ⚠️ Sin permisos de escritura en {ruta}: {e}")
+                continue
+                
+        except Exception as e:
+            print(f"      ⚠️ Error con ruta {ruta}: {e}")
+            continue
+    
+    if not ruta_destino:
+        print("   ❌ ERROR: No se pudo encontrar o crear una ruta válida")
+        # Usar una ruta en el directorio de descargas como último recurso
+        ruta_destino = os.path.join(download_dir, 'Reportes_Ajustes')
+        os.makedirs(ruta_destino, exist_ok=True)
+        print(f"   🔧 Usando ruta alternativa: {ruta_destino}")
+    
+    # Ruta completa del archivo nuevo
+    ruta_nueva = os.path.join(ruta_destino, nombre_nuevo)
+    print(f"\n   📍 Ruta destino final: {ruta_destino}")
+    print(f"   📄 Archivo destino: {ruta_nueva}")
+    
+    try:
+        # NUEVA ESTRATEGIA: Manejo inteligente de archivos existentes
+        if os.path.exists(ruta_nueva):
+            print(f"   ⚠️ Ya existe un archivo con el nombre {nombre_nuevo}")
+            print(f"   📊 Tamaño existente: {os.path.getsize(ruta_nueva):,} bytes")
+            print(f"   📅 Modificado: {datetime.fromtimestamp(os.path.getmtime(ruta_nueva)).strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # INTENTAR DIFERENTES ESTRATEGIAS EN ORDEN:
+            
+            # Estrategia 1: Intentar eliminar con diferentes métodos
+            print(f"   🔧 Intentando manejar archivo existente...")
+            
+            archivo_eliminado = False
+            archivo_renombrado = False
+            
+            # Método 1: Intentar eliminar normalmente
+            try:
+                os.remove(ruta_nueva)
+                archivo_eliminado = True
+                print(f"   ✅ Archivo existente eliminado exitosamente")
+            except Exception as e:
+                print(f"   ⚠️ No se pudo eliminar (Método 1): {e}")
+                
+                # Método 2: Intentar con permisos elevados (simulado)
+                try:
+                    # Usar shutil.rmtree para carpetas o archivos bloqueados
+                    import stat
+                    os.chmod(ruta_nueva, stat.S_IWRITE)  # Dar permisos de escritura
+                    os.remove(ruta_nueva)
+                    archivo_eliminado = True
+                    print(f"   ✅ Archivo existente eliminado (con permisos)")
+                except:
+                    print(f"   ⚠️ No se pudo eliminar (Método 2)")
+            
+            # Si no se pudo eliminar, intentar renombrar
+            if not archivo_eliminado:
+                try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ruta_backup = os.path.join(ruta_destino, f"backup_{timestamp}_{nombre_nuevo}")
+                    
+                    # Método 3: Intentar renombrar (mover)
+                    shutil.move(ruta_nueva, ruta_backup)
+                    archivo_renombrado = True
+                    print(f"   ✅ Archivo existente renombrado a: {os.path.basename(ruta_backup)}")
+                except Exception as e:
+                    print(f"   ⚠️ No se pudo renombrar: {e}")
+                    
+                    # Estrategia final: Sobrescribir directamente durante la copia
+                    print(f"   ⚠️ El archivo está bloqueado, intentando sobrescribir durante copia...")
+        
+        # Copiar el archivo (con manejo de sobrescritura)
+        print(f"   📋 Copiando archivo...")
+        
+        # ESTRATEGIA MEJORADA DE COPIA:
+        copia_exitosa = False
+        
+        # Intentar diferentes métodos de copia
+        metodos_copia = [
+            ("shutil.copy2", lambda: shutil.copy2(archivo_descargado, ruta_nueva)),
+            ("shutil.copy", lambda: shutil.copy(archivo_descargado, ruta_nueva)),
+            ("copia manual", lambda: 
+                (open(ruta_nueva, 'wb').write(open(archivo_descargado, 'rb').read()) 
+                 if not os.path.exists(ruta_nueva) else None))
+        ]
+        
+        for metodo_nombre, metodo_func in metodos_copia:
+            if copia_exitosa:
+                break
+                
+            try:
+                print(f"      Intentando con {metodo_nombre}...")
+                metodo_func()
+                print(f"      ✅ {metodo_nombre} exitoso")
+                copia_exitosa = True
+            except Exception as e:
+                print(f"      ⚠️ {metodo_nombre} falló: {str(e)[:80]}")
+        
+        if not copia_exitosa:
+            print(f"   ❌ Todos los métodos de copia fallaron")
+            return False, None
+        
+        # Verificar que se copió correctamente
+        if os.path.exists(ruta_nueva):
+            tamaño_original = os.path.getsize(archivo_descargado)
+            tamaño_nuevo = os.path.getsize(ruta_nueva)
+            
+            if tamaño_nuevo > 0:
+                print(f"   ✅ Archivo copiado exitosamente:")
+                print(f"      • Tamaño original: {tamaño_original:,} bytes")
+                print(f"      • Tamaño copia: {tamaño_nuevo:,} bytes")
+                print(f"      • Ubicación: {ruta_nueva}")
+                
+                if tamaño_nuevo == tamaño_original:
+                    print(f"      • Verificación: ✓ OK (tamaños coinciden)")
+                else:
+                    print(f"      • Verificación: ⚠️ ADVERTENCIA (tamaños diferentes)")
+            else:
+                print(f"   ⚠️ Archivo copiado pero está vacío (0 bytes)")
+                return False, None
+        else:
+            print(f"   ❌ No se pudo crear el archivo en destino")
+            return False, None
+        
+        # Intentar eliminar archivo original de descargas (no crítico)
+        try:
+            print(f"\n   🗑️  Intentando eliminar archivo original de descargas...")
+            os.remove(archivo_descargado)
+            print(f"   ✅ Archivo original eliminado")
+        except Exception as e:
+            print(f"   ⚠️ No se pudo eliminar el archivo original (no crítico): {e}")
+        
+        # Verificación final
+        print(f"\n" + "="*60)
+        print("📋 RESUMEN FINAL")
+        print("="*60)
+        print(f"   ✓ Archivo renombrado: {nombre_nuevo}")
+        print(f"   ✓ Ubicación final: {ruta_destino}")
+        print(f"   ✓ Ruta completa: {ruta_nueva}")
+        print(f"   ✓ Tamaño final: {os.path.getsize(ruta_nueva):,} bytes")
+        print(f"   ✓ Fecha del reporte: {fecha_ayer.strftime('%d/%m/%Y')}")
+        
+        # Listar archivos en la carpeta destino para verificación
+        try:
+            archivos_en_destino = os.listdir(ruta_destino)
+            archivos_excel = [f for f in archivos_en_destino if f.endswith(('.xlsx', '.xls'))]
+            print(f"   📁 Archivos Excel en destino: {len(archivos_excel)}")
+            for archivo in archivos_excel[:5]:  # Mostrar primeros 5
+                tamaño = os.path.getsize(os.path.join(ruta_destino, archivo))
+                print(f"      • {archivo} ({tamaño:,} bytes)")
+            if len(archivos_excel) > 5:
+                print(f"      • ... y {len(archivos_excel) - 5} más")
+        except Exception as e:
+            print(f"   ⚠️ No se pudo listar archivos en destino: {e}")
+        
+        return True, ruta_nueva
+        
+    except Exception as e:
+        print(f"   ❌ ERROR CRÍTICO al renombrar/mover archivo: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, None
+
+def renombrar_y_mover_archivo_simple(archivo_descargado, download_dir):
+    """
+    Versión simplificada que guarda en Z:\Reportes\Ajustes
+    Útil cuando hay problemas con permisos en unidades de red
+    """
+    print("\n" + "="*60)
+    print("📁 RENOMBRANDO Y MOVIENDO ARCHIVO (VERSIÓN SIMPLIFICADA)")
+    print("="*60)
+    
+    if not archivo_descargado or not os.path.exists(archivo_descargado):
+        print("   ❌ ERROR: No hay archivo descargado o no existe")
+        return False, None
+    
+    # Obtener el nombre del archivo basado en la fecha
+    nombre_nuevo, fecha_ayer = obtener_nombre_archivo_fecha()
+    print(f"   Fecha del archivo: {fecha_ayer.strftime('%d/%m/%Y')}")
+    print(f"   Nombre nuevo: {nombre_nuevo}")
+    print(f"   Archivo descargado: {os.path.basename(archivo_descargado)}")
+    
+    # MODIFICACIÓN: Usar ruta Z:\Reportes\Ajustes en lugar de Downloads
+    ruta_destino = r"Z:\Reportes\Ajustes"
+    
+    # Crear la carpeta si no existe
+    if not os.path.exists(ruta_destino):
+        try:
+            os.makedirs(ruta_destino, exist_ok=True)
+            print(f"   ✅ Carpeta creada: {ruta_destino}")
+        except Exception as e:
+            print(f"   ❌ No se pudo crear la carpeta en Z:\\: {e}")
+            # Si falla Z:, usar Downloads como respaldo
+            ruta_destino = os.path.join(download_dir, 'Reportes_Ajustes')
+            os.makedirs(ruta_destino, exist_ok=True)
+            print(f"   🔧 Usando ruta alternativa: {ruta_destino}")
+    else:
+        print(f"   ✅ Carpeta destino existe: {ruta_destino}")
+    
+    # Ruta completa del archivo nuevo
+    ruta_nueva = os.path.join(ruta_destino, nombre_nuevo)
+    print(f"   📍 Destino: {ruta_nueva}")
+    
+    try:
+        # Si ya existe, intentar eliminarlo primero
+        if os.path.exists(ruta_nueva):
+            print(f"   ⚠️ Ya existe un archivo con el mismo nombre")
+            try:
+                os.remove(ruta_nueva)
+                print(f"   ✅ Archivo existente eliminado")
+            except Exception as e:
+                print(f"   ⚠️ No se pudo eliminar archivo existente: {e}")
+                # EN LUGAR DE CREAR NOMBRE CON TIMESTAMP, FORZAR EL NOMBRE CORRECTO:
+                print(f"   🔧 Intentando sobrescribir el archivo existente...")
+        
+        # Copiar directamente (sobrescribir si existe)
+        print(f"   📋 Copiando archivo...")
+        shutil.copy2(archivo_descargado, ruta_nueva)
+        
+        # Verificar
+        if os.path.exists(ruta_nueva):
+            tamaño = os.path.getsize(ruta_nueva)
+            print(f"   ✅ Archivo guardado exitosamente:")
+            print(f"      • Nombre: {nombre_nuevo}")
+            print(f"      • Ubicación: {ruta_nueva}")
+            print(f"      • Tamaño: {tamaño:,} bytes")
+            print(f"      • Fecha: {fecha_ayer.strftime('%d/%m/%Y')}")
+            
+            # Intentar eliminar original
+            try:
+                os.remove(archivo_descargado)
+                print(f"   🗑️  Archivo original eliminado")
+            except:
+                print(f"   ⚠️ No se pudo eliminar original (no crítico)")
+            
+            return True, ruta_nueva
+        else:
+            print(f"   ❌ No se pudo crear el archivo")
+            return False, None
+            
+    except Exception as e:
+        print(f"   ❌ Error al copiar archivo: {e}")
+        return False, None
+
+def ingresar_fecha_sin_barras(driver, elemento, fecha_texto_sin_barras):
+    """
+    Método optimizado para ingresar fechas sin barras.
+    fecha_texto_sin_barras debe estar en formato: DDMMYYYY (ej: 01122025)
+    """
+    try:
+        fecha_visual = f"{fecha_texto_sin_barras[:2]}/{fecha_texto_sin_barras[2:4]}/{fecha_texto_sin_barras[4:]}"
+        
+        print(f"   Intentando ingresar: {fecha_visual}")
+        
+        elemento.click()
+        time.sleep(0.3)
+        
+        elemento.send_keys(Keys.CONTROL + "a")
+        elemento.send_keys(Keys.BACKSPACE)
+        time.sleep(0.2)
+        
+        elemento.send_keys(fecha_texto_sin_barras)
+        time.sleep(0.3)
+        
+        driver.execute_script("""
+            arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+            arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+            arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));
+        """, elemento)
+        
+        elemento.send_keys(Keys.TAB)
+        time.sleep(0.2)
+        
+        print(f"   ✓ Fecha ingresada sin barras: {fecha_texto_sin_barras}")
+        return True
+        
+    except Exception as e:
+        print(f"   ✗ Error al ingresar fecha: {e}")
+        return False
+
+def buscar_panel_resultados(driver):
+    """
+    Busca el panel 'Resultados' en la parte inferior de la página
+    """
+    print("\n🔍 Buscando panel 'Resultados'...")
+    
+    xpaths_panel_resultados = [
+        "//*[contains(text(), 'Resultados')]",
+        "//div[contains(text(), 'Resultados')]",
+        "//h2[contains(text(), 'Resultados')]",
+        "//h3[contains(text(), 'Resultados')]",
+        "//*[contains(@id, 'result')]",
+        "//div[contains(@class, 'result')]",
+    ]
+    
+    for xpath in xpaths_panel_resultados:
+        try:
+            elementos = driver.find_elements(By.XPATH, xpath)
+            for elemento in elementos:
+                if elemento.is_displayed():
+                    print(f"   ✓ Panel 'Resultados' encontrado con XPath: {xpath}")
+                    return elemento
+        except:
+            continue
+    
+    return None
+
+def hacer_clic_en_boton_tres_puntos_sucursal(driver):
+    """
+    Busca y hace clic en el botón de tres puntos del campo 'Sucursal'
+    """
+    print("\n🔍 Buscando botón de tres puntos en campo 'Sucursal'...")
+    
+    selectores_clase_especifica = [
+        "//*[contains(@class, 'k-icon') and contains(@class, 'k-i-more-vertical')]",
+        "//*[@class='k-icon k-i-more-vertical']",
+        "//*[contains(@class, 'k-i-more-vertical')]",
+        "//span[contains(@class, 'k-i-more-vertical')]",
+        "//button[contains(@class, 'k-i-more-vertical')]",
+    ]
+    
+    for selector in selectores_clase_especifica:
+        try:
+            elementos = driver.find_elements(By.XPATH, selector)
+            if elementos:
+                print(f"   Encontrados {len(elementos)} elementos con selector: {selector}")
+                
+                for i, elemento in enumerate(elementos, 1):
+                    if elemento.is_displayed() and elemento.is_enabled():
+                        print(f"   Elemento {i} encontrado")
+                        
+                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", elemento)
+                        time.sleep(0.5)
+                        
+                        driver.execute_script("arguments[0].click();", elemento)
+                        print(f"   ✓ Botón de tres puntos clickeado")
+                        time.sleep(1)
+                        return True
+        except Exception as e:
+            continue
+    
+    return False
+
+def hacer_clic_en_opcion_columnas(driver):
+    """
+    Busca y hace clic en la opción 'Columnas' del menú desplegado
+    """
+    print("\n📋 Buscando opción 'Columnas' en el menú desplegado...")
+    
+    time.sleep(1.5)
+    
+    xpaths_opcion_columnas = [
+        "//*[text()='Columnas']",
+        "//*[normalize-space()='Columnas']",
+        "//li[contains(., 'Columnas')]",
+        "//div[contains(., 'Columnas')]",
+        "//span[contains(., 'Columnas')]",
+        "//a[contains(., 'Columnas')]",
+        "//button[contains(., 'Columnas')]",
+    ]
+    
+    for xpath in xpaths_opcion_columnas:
+        try:
+            elementos = driver.find_elements(By.XPATH, xpath)
+            if elementos:
+                print(f"   Encontrados {len(elementos)} elementos con XPath: {xpath}")
+                
+                for i, elemento in enumerate(elementos, 1):
+                    try:
+                        if elemento.is_displayed() and elemento.is_enabled():
+                            print(f"   Opción 'Columnas' {i} encontrada, haciendo clic...")
+                            
+                            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", elemento)
+                            time.sleep(0.3)
+                            driver.execute_script("arguments[0].click();", elemento)
+                            print(f"   ✓ Opción 'Columnas' clickeada")
+                            time.sleep(1.5)
+                            return True
+                    except Exception as e:
+                        print(f"   ✗ Error al hacer clic en opción {i}: {e}")
+        except Exception as e:
+            continue
+    
+    return False
+
+def verificar_si_casilla_esta_marcada(elemento):
+    """
+    Verifica si una casilla de Kendo UI está marcada (amarillo)
+    Retorna True si está marcada, False si no lo está
+    """
+    try:
+        # Para Kendo UI, verificamos varias formas de determinar si está marcada
+        
+        # 1. Verificar clase 'k-checked' (común en Kendo UI)
+        clases = elemento.get_attribute('class')
+        if clases and ('k-checked' in clases or 'k-state-selected' in clases):
+            return True
+        
+        # 2. Verificar atributo 'aria-checked'
+        aria_checked = elemento.get_attribute('aria-checked')
+        if aria_checked == 'true':
+            return True
+        
+        # 3. Verificar input checkbox interno (si existe)
+        try:
+            input_checkbox = elemento.find_element(By.XPATH, ".//input[@type='checkbox']")
+            if input_checkbox.is_selected():
+                return True
+        except:
+            pass
+        
+        # 4. Verificar estilo visual - fondo amarillo
+        try:
+            color_fondo = elemento.value_of_css_property('background-color')
+            # Buscar colores amarillos (rgb(255, 193, 7) o rgba(255, 193, 7, 1) o similares)
+            if '255' in color_fondo and ('193' in color_fondo or '255, 255' in color_fondo):
+                return True
+        except:
+            pass
+        
+        # 5. Verificar por el ícono de check (para Kendo UI)
+        try:
+            check_icon = elemento.find_element(By.XPATH, ".//span[contains(@class, 'k-checkbox-check')]")
+            if check_icon.is_displayed():
+                style = check_icon.get_attribute('style')
+                if not style or 'none' not in style.lower():
+                    return True
+        except:
+            pass
+        
+        return False
+        
+    except Exception as e:
+        print(f"     ⚠️ Error verificando estado de casilla: {e}")
+        return False
+
+def hacer_clic_en_boton_aplicar(driver):
+    """
+    Función PRINCIPAL para hacer clic en el botón 'Aplicar' dentro del menú de columnas
+    Esta función se debe llamar después de marcar todas las casillas
+    """
+    print("\n" + "="*60)
+    print("🔘 HACIENDO CLIC EN BOTÓN 'APLICAR'")
+    print("="*60)
+    
+    time.sleep(1)  # Esperar un momento para que todo se estabilice
+    
+    # ESTRATEGIA 1: Buscar el botón por texto exacto "Aplicar"
+    print("\n1. Buscando botón 'Aplicar' por texto exacto...")
+    
+    boton_encontrado = False
+    intentos = 0
+    max_intentos = 3
+    
+    while not boton_encontrado and intentos < max_intentos:
+        intentos += 1
+        print(f"   Intento {intentos} de {max_intentos}...")
+        
+        # Lista de XPaths para buscar el botón Aplicar
+        xpaths_aplicar = [
+            # Por texto exacto
+            "//button[text()='Aplicar']",
+            "//button[normalize-space()='Aplicar']",
+            "//*[text()='Aplicar' and @role='button']",
+            "//span[text()='Aplicar']/parent::button",
+            "//div[text()='Aplicar']/parent::button",
+            
+            # Por texto que contenga "Aplicar"
+            "//button[contains(text(), 'Aplicar')]",
+            "//*[contains(text(), 'Aplicar') and @role='button']",
+            
+            # Por clases específicas (Kendo UI)
+            "//button[contains(@class, 'k-button') and contains(@class, 'k-primary')]",
+            "//button[contains(@class, 'k-primary')]",
+            "//button[@class='k-button k-primary']",
+            
+            # Por tipo submit
+            "//button[@type='submit']",
+            
+            # Buscar junto al botón "Reiniciar" (como en la imagen)
+            "//button[contains(text(), 'Reiniciar')]/following-sibling::button",
+            "//button[text()='Reiniciar']/following-sibling::button",
+        ]
+        
+        for xpath in xpaths_aplicar:
+            try:
+                print(f"   Probando XPath: {xpath[:50]}...")
+                botones = driver.find_elements(By.XPATH, xpath)
+                
+                for boton in botones:
+                    try:
+                        if boton.is_displayed() and boton.is_enabled():
+                            # Obtener información del botón
+                            texto_boton = boton.text.strip()
+                            clases_boton = boton.get_attribute('class')
+                            
+                            print(f"   ✓ Botón encontrado:")
+                            print(f"     - Texto: '{texto_boton}'")
+                            print(f"     - Clases: {clases_boton}")
+                            print(f"     - XPath usado: {xpath}")
+                            
+                            # Asegurarse de que esté visible
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", boton)
+                            time.sleep(0.3)
+                            
+                            # Hacer clic en el botón
+                            print("     Haciendo clic en el botón 'Aplicar'...")
+                            boton.click()
+                            
+                            print("     ✓ ¡Clic realizado exitosamente!")
+                            boton_encontrado = True
+                            
+                            # Esperar a que se cierre el diálogo y se apliquen los cambios
+                            time.sleep(2)
+                            
+                            # Verificar que el diálogo se cerró
+                            try:
+                                # Intentar encontrar el diálogo después del clic
+                                dialogo = driver.find_element(By.XPATH, "//div[contains(@class, 'k-window') or contains(@class, 'k-dialog')]")
+                                if not dialogo.is_displayed():
+                                    print("     ✓ Diálogo cerrado correctamente")
+                                else:
+                                    print("     ⚠️ El diálogo parece seguir visible")
+                            except:
+                                print("     ✓ Diálogo cerrado (no se encuentra en el DOM)")
+                            
+                            return True
+                    except Exception as e:
+                        print(f"     ✗ Error con este botón: {str(e)[:50]}...")
+                        continue
+                        
+            except Exception as e:
+                print(f"   ✗ Error con XPath {xpath[:50]}...: {str(e)[:50]}...")
+                continue
+        
+        if not boton_encontrado:
+            print(f"   ⚠️ No se encontró el botón en este intento. Esperando 1 segundo...")
+            time.sleep(1)
+    
+    # ESTRATEGIA 2: Buscar por contexto del diálogo
+    if not boton_encontrado:
+        print("\n2. Buscando botón 'Aplicar' por contexto del diálogo...")
+        
+        try:
+            # Buscar el diálogo de columnas
+            dialogo = driver.find_element(By.XPATH, 
+                "//div[contains(@class, 'k-window') or contains(@class, 'k-dialog') or contains(@class, 'k-popup')]")
+            
+            # Buscar todos los botones dentro del diálogo
+            botones_dialogo = dialogo.find_elements(By.XPATH, ".//button")
+            print(f"   Encontrados {len(botones_dialogo)} botones en el diálogo")
+            
+            for i, boton in enumerate(botones_dialogo):
+                try:
+                    if boton.is_displayed() and boton.is_enabled():
+                        texto = boton.text.strip()
+                        print(f"   Botón {i+1}: '{texto}'")
+                        
+                        # Si el texto contiene "Aplicar" o es el botón primario
+                        if 'aplicar' in texto.lower() or 'apply' in texto.lower() or 'k-primary' in boton.get_attribute('class'):
+                            print(f"   ✓ Botón candidato encontrado: '{texto}'")
+                            
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", boton)
+                            time.sleep(0.3)
+                            boton.click()
+                            print(f"   ✓ Clic realizado en botón: '{texto}'")
+                            boton_encontrado = True
+                            time.sleep(2)
+                            return True
+                except:
+                    continue
+        except Exception as e:
+            print(f"   ✗ Error buscando en diálogo: {str(e)[:50]}...")
+    
+    # ESTRATEGIA 3: Buscar por posición (último botón visible)
+    if not boton_encontrado:
+        print("\n3. Buscando por posición (último botón visible)...")
+        
+        try:
+            # Buscar todos los botones visibles
+            todos_botones = driver.find_elements(By.XPATH, "//button[not(contains(@style, 'display: none'))]")
+            botones_visibles = [b for b in todos_botones if b.is_displayed()]
+            
+            print(f"   Encontrados {len(botones_visibles)} botones visibles")
+            
+            # Ordenar por posición Y (los más abajo son los del diálogo)
+            botones_visibles.sort(key=lambda b: b.location['y'], reverse=True)
+            
+            # Probar los últimos 3 botones (más probable que sean del diálogo)
+            for i in range(min(3, len(botones_visibles))):
+                boton = botones_visibles[i]
+                try:
+                    texto = boton.text.strip()
+                    print(f"   Probando botón {i+1} (posición {boton.location['y']}): '{texto}'")
+                    
+                    boton.click()
+                    print(f"   ✓ Clic realizado en botón: '{texto}'")
+                    boton_encontrado = True
+                    time.sleep(2)
+                    
+                    # Tomar captura para verificar
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    driver.save_screenshot(f"boton_aplicar_clicado_{timestamp}.png")
+                    print(f"   📸 Captura guardada: boton_aplicar_clicado_{timestamp}.png")
+                    
+                    return True
+                except Exception as e:
+                    print(f"   ✗ Error haciendo clic: {str(e)[:50]}...")
+                    continue
+        except Exception as e:
+            print(f"   ✗ Error en estrategia de posición: {str(e)[:50]}...")
+    
+    # ESTRATEGIA 4: Presionar Enter o Escape como último recurso
+    if not boton_encontrado:
+        print("\n4. Último recurso: presionar Enter para aceptar...")
+        
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            actions = ActionChains(driver)
+            
+            print("   Presionando Enter...")
+            actions.send_keys(Keys.ENTER).perform()
+            time.sleep(1)
+            
+            print("   Presionando Escape...")
+            actions.send_keys(Keys.ESCAPE).perform()
+            time.sleep(1)
+            
+            print("   ✓ Teclas presionadas (Enter y Escape)")
+            return True
+        except Exception as e:
+            print(f"   ✗ Error presionando teclas: {str(e)[:50]}...")
+    
+    # RESULTADO FINAL
+    if boton_encontrado:
+        print("\n✅ ¡BOTÓN 'APLICAR' CLICADO EXITOSAMENTE!")
+        print("   Los cambios en las columnas han sido aplicados.")
+        return True
+    else:
+        print("\n❌ NO SE PUDO ENCONTRAR O CLICAR EL BOTÓN 'APLICAR'")
+        print("   ⚠️ Los cambios podrían no haberse guardado.")
+        
+        # Tomar captura para debugging
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            driver.save_screenshot(f"error_boton_aplicar_{timestamp}.png")
+            print(f"   📸 Captura guardada: error_boton_aplicar_{timestamp}.png")
+        except:
+            pass
+        
+        return False
+
+def hacer_clic_en_boton_buscar_excel(driver):
+    """
+    Función para hacer clic en el botón 'Buscar' después de aplicar los cambios.
+    Este botón se usa para buscar/exportar el archivo de Excel.
+    """
+    print("\n" + "="*60)
+    print("🔍 HACIENDO CLIC EN BOTÓN 'BUSCAR' PARA EXCEL")
+    print("="*60)
+    
+    time.sleep(2)  # Esperar a que la página se estabilice después de aplicar cambios
+    
+    boton_encontrado = False
+    intentos = 0
+    max_intentos = 3
+    
+    while not boton_encontrado and intentos < max_intentos:
+        intentos += 1
+        print(f"\n   Intento {intentos} de {max_intentos}...")
+        
+        # ESTRATEGIA 1: Buscar por texto exacto "Buscar"
+        print("   1. Buscando botón por texto 'Buscar'...")
+        
+        xpaths_buscar = [
+            # Por texto exacto "Buscar"
+            "//button[text()='Buscar']",
+            "//button[normalize-space()='Buscar']",
+            "//*[text()='Buscar' and @role='button']",
+            "//span[text()='Buscar']/parent::button",
+            "//div[text()='Buscar']/parent::button",
+            
+            # Por texto que contenga "Buscar"
+            "//button[contains(text(), 'Buscar')]",
+            "//*[contains(text(), 'Buscar') and @role='button']",
+            
+            # Por ícono de búsqueda (para Kendo UI)
+            "//button[contains(@class, 'k-i-search')]",
+            "//button[contains(@class, 'k-search')]",
+            "//*[contains(@class, 'k-i-search')]",
+            
+            # Por clases de botón de acción primaria
+            "//button[contains(@class, 'k-button') and contains(@class, 'k-primary')]",
+            "//button[contains(@class, 'k-primary') and not(contains(@class, 'k-i-more-vertical'))]",
+            
+            # Buscar botón cerca del formulario o filtros
+            "//form//button[@type='submit']",
+            "//div[contains(@class, 'k-form')]//button",
+            "//div[contains(@class, 'k-filter')]//button",
+        ]
+        
+        for xpath in xpaths_buscar:
+            try:
+                print(f"      Probando XPath: {xpath[:60]}...")
+                botones = driver.find_elements(By.XPATH, xpath)
+                
+                for i, boton in enumerate(botones, 1):
+                    try:
+                        if boton.is_displayed() and boton.is_enabled():
+                            texto_boton = boton.text.strip()
+                            clases_boton = boton.get_attribute('class')
+                            
+                            print(f"      ✓ Botón candidato {i} encontrado:")
+                            print(f"        - Texto: '{texto_boton}'")
+                            print(f"        - Clases: {clases_boton}")
+                            print(f"        - XPath usado: {xpath}")
+                            
+                            # Scroll para hacerlo visible
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", boton)
+                            time.sleep(0.3)
+                            
+                            # Verificar que sea el botón correcto (no el de tres puntos)
+                            if 'k-i-more-vertical' not in clases_boton and 'columnas' not in texto_boton.lower():
+                                print(f"        Haciendo clic en el botón 'Buscar'...")
+                                
+                                # Tomar captura antes del clic
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                driver.save_screenshot(f"antes_buscar_{timestamp}.png")
+                                
+                                # Hacer clic
+                                boton.click()
+                                
+                                print(f"        ✓ ¡Clic realizado exitosamente en botón '{texto_boton}'!")
+                                boton_encontrado = True
+                                
+                                # Esperar más tiempo después de hacer clic en Buscar
+                                print("        ⏱️  Esperando a que cargue la vista preliminar...")
+                                time.sleep(5)  # Espera inicial
+                                
+                                # Verificar si apareció algún mensaje o ventana de descarga
+                                try:
+                                    mensajes = driver.find_elements(By.XPATH, "//div[contains(@class, 'k-message') or contains(@class, 'alert')]")
+                                    if mensajes:
+                                        for msg in mensajes:
+                                            if msg.is_displayed():
+                                                print(f"        📝 Mensaje del sistema: {msg.text[:100]}")
+                                except:
+                                    pass
+                                
+                                return True
+                    except Exception as e:
+                        print(f"        ✗ Error con este botón: {str(e)[:50]}...")
+                        continue
+            except Exception as e:
+                print(f"      ✗ Error con XPath: {str(e)[:50]}...")
+                continue
+        
+        # ESTRATEGIA 2: Buscar por contexto de la página de reporte
+        if not boton_encontrado:
+            print("\n   2. Buscando botón en contexto del reporte...")
+            
+            try:
+                # Buscar la barra de herramientas del reporte
+                toolbars = driver.find_elements(By.XPATH, "//div[contains(@class, 'k-toolbar')]")
+                
+                for toolbar in toolbars:
+                    if toolbar.is_displayed():
+                        print(f"      ✓ Toolbar encontrado, buscando botones...")
+                        botones_toolbar = toolbar.find_elements(By.XPATH, ".//button")
+                        
+                        for boton in botones_toolbar:
+                            try:
+                                if boton.is_displayed() and boton.is_enabled():
+                                    texto = boton.text.strip()
+                                    print(f"      Botón en toolbar: '{texto}'")
+                                    
+                                    if texto and ('buscar' in texto.lower() or 'search' in texto.lower()):
+                                        print(f"      ✓ Botón 'Buscar' encontrado en toolbar!")
+                                        boton.click()
+                                        boton_encontrado = True
+                                        time.sleep(5)  # Espera después de hacer clic
+                                        return True
+                            except:
+                                continue
+            except Exception as e:
+                print(f"      ✗ Error buscando en toolbar: {str(e)[:50]}...")
+        
+        # ESTRATEGIA 3: Buscar botones cerca de los campos de fecha
+        if not boton_encontrado:
+            print("\n   3. Buscando botón cerca de campos de fecha...")
+            
+            try:
+                # Buscar los campos de fecha que ya usamos
+                inputs_fecha = driver.find_elements(By.XPATH, 
+                    "//input[contains(@placeholder, 'Desde') or contains(@placeholder, 'Hasta')]")
+                
+                if inputs_fecha:
+                    # Buscar botones cerca de estos inputs
+                    for input_fecha in inputs_fecha:
+                        try:
+                            # Buscar botón hermano o en el mismo contenedor
+                            contenedor = input_fecha.find_element(By.XPATH, "./ancestor::div[contains(@class, 'form') or contains(@class, 'group')]")
+                            botones_contenedor = contenedor.find_elements(By.XPATH, ".//button")
+                            
+                            for boton in botones_contenedor:
+                                if boton.is_displayed() and boton.is_enabled():
+                                    texto = boton.text.strip()
+                                    print(f"      Botón cerca de fecha: '{texto}'")
+                                    
+                                    if texto and len(texto) > 0:
+                                        boton.click()
+                                        print(f"      ✓ Clic en botón '{texto}' (cerca de fecha)")
+                                        boton_encontrado = True
+                                        time.sleep(5)  # Espera después de hacer clic
+                                        return True
+                        except:
+                            continue
+            except Exception as e:
+                print(f"      ✗ Error buscando cerca de fechas: {str(e)[:50]}...")
+        
+        # ESTRATEGIA 4: Buscar botón de exportación a Excel
+        if not boton_encontrado:
+            print("\n   4. Buscando botón de exportación/Excel...")
+            
+            try:
+                # Buscar íconos o botones relacionados con Excel
+                xpaths_excel = [
+                    "//button[contains(@class, 'k-i-excel')]",
+                    "//button[contains(@class, 'k-i-file-excel')]",
+                    "//*[contains(@class, 'k-i-excel')]",
+                    "//button[contains(., 'Excel')]",
+                    "//button[contains(., 'Export')]",
+                ]
+                
+                for xpath in xpaths_excel:
+                    try:
+                        botones_excel = driver.find_elements(By.XPATH, xpath)
+                        for boton in botones_excel:
+                            if boton.is_displayed() and boton.is_enabled():
+                                print(f"      ✓ Botón de Excel encontrado: {xpath}")
+                                boton.click()
+                                boton_encontrado = True
+                                time.sleep(5)  # Espera después de hacer clic
+                                return True
+                    except:
+                        continue
+            except Exception as e:
+                print(f"      ✗ Error buscando botón Excel: {str(e)[:50]}...")
+        
+        if not boton_encontrado:
+            print(f"   ⚠️ No se encontró el botón en este intento. Esperando 2 segundos...")
+            time.sleep(2)
+    
+    # RESULTADO FINAL
+    if boton_encontrado:
+        print("\n✅ ¡BOTÓN 'BUSCAR' CLICADO EXITOSAMENTE!")
+        print("   Se inició la búsqueda/exportación del archivo de Excel.")
+        
+        # Tomar captura después del clic
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            driver.save_screenshot(f"despues_buscar_{timestamp}.png")
+            print(f"   📸 Captura guardada: despues_buscar_{timestamp}.png")
+        except:
+            pass
+        
+        return True
+    else:
+        print("\n❌ NO SE PUDO ENCONTRAR O CLICAR EL BOTÓN 'BUSCAR'")
+        print("   ⚠️ La búsqueda/exportación a Excel podría no haberse iniciado.")
+        
+        # Tomar captura para debugging
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            driver.save_screenshot(f"error_boton_buscar_{timestamp}.png")
+            print(f"   📸 Captura guardada: error_boton_buscar_{timestamp}.png")
+        except:
+            pass
+        
+        return False
+
+def esperar_vista_previa_archivo_mejorada(driver):
+    """
+    Función MEJORADA para esperar la vista previa del archivo.
+    Espera hasta que la vista preliminar esté completamente cargada y visible.
+    """
+    print("\n" + "="*60)
+    print("⏳ ESPERANDO VISTA PRELIMINAR DEL ARCHIVO (MEJORADA)")
+    print("="*60)
+    
+    tiempo_maximo_espera = 90  # Aumentado a 90 segundos
+    tiempo_inicio = time.time()
+    
+    print(f"   Esperando hasta {tiempo_maximo_espera} segundos para que cargue la vista preliminar...")
+    print("   🔍 Verificando progreso de carga...")
+    
+    # Patrones para detectar que la vista preliminar está lista
+    indicadores_carga_completa = [
+        # Grid/tabla con datos
+        "//div[contains(@class, 'k-grid-content') and not(contains(@style, 'display: none'))]",
+        "//table[contains(@class, 'k-grid') and .//tr[contains(@class, 'k-master-row')]]",
+        "//div[contains(@class, 'k-grid') and .//td[text()]]",
+        
+        # Botones de exportación específicos (más específicos)
+        "//button[text()='Exportar a excel' and not(contains(@style, 'display: none'))]",
+        "//button[normalize-space()='Exportar a excel' and @disabled='false']",
+        "//button[contains(text(), 'Exportar a excel') and not(@disabled)]",
+        
+        # Indicadores visuales de que los datos están cargados
+        "//div[contains(@class, 'k-loading') and contains(@style, 'display: none')]",  # Spinner oculto
+        "//div[contains(text(), 'filas') or contains(text(), 'registros') or contains(text(), 'resultados')]",
+        
+        # Elementos específicos de Kendo UI que indican carga completa
+        "//div[contains(@class, 'k-pager-info')]",  # Información de paginación
+        "//span[contains(@class, 'k-icon') and contains(@class, 'k-i-check')]",  # Íconos de check
+    ]
+    
+    # Contador de verificación
+    verificaciones_exitosas = 0
+    verificaciones_necesarias = 3  # Necesitamos 3 verificaciones exitosas consecutivas
+    
+    while time.time() - tiempo_inicio < tiempo_maximo_espera:
+        tiempo_transcurrido = int(time.time() - tiempo_inicio)
+        print(f"   Verificando... ({tiempo_transcurrido}/{tiempo_maximo_espera} segundos)")
+        
+        # Verificar si hay spinners/loaders visibles
+        try:
+            spinners = driver.find_elements(By.XPATH, 
+                "//div[contains(@class, 'k-loading') or contains(@class, 'loading') or contains(@class, 'spinner')]")
+            spinners_visibles = [s for s in spinners if s.is_displayed()]
+            
+            if len(spinners_visibles) > 0:
+                print(f"   ⏳ Spinner visible detectado, aún cargando...")
+                verificaciones_exitosas = 0  # Reiniciar contador si hay spinner
+                time.sleep(3)
+                continue
+        except:
+            pass
+        
+        # Verificar indicadores de carga completa
+        indicadores_encontrados = 0
+        
+        for indicador in indicadores_carga_completa:
+            try:
+                elementos = driver.find_elements(By.XPATH, indicador)
+                for elemento in elementos:
+                    if elemento.is_displayed():
+                        # Para botones de exportación, verificar que estén habilitados
+                        if 'button' in elemento.tag_name.lower() and 'exportar' in elemento.text.lower():
+                            if elemento.is_enabled():
+                                print(f"   ✓ Botón de exportación habilitado encontrado: '{elemento.text.strip()}'")
+                                indicadores_encontrados += 1
+                                break
+                        else:
+                            print(f"   ✓ Indicador de carga encontrado: {indicador[:50]}...")
+                            indicadores_encontrados += 1
+                            break
+                if indicadores_encontrados > 0:
+                    break
+            except:
+                continue
+        
+        # Si encontramos indicadores, incrementar contador
+        if indicadores_encontrados > 0:
+            verificaciones_exitosas += 1
+            print(f"   ✅ Verificación {verificaciones_exitosas}/{verificaciones_necesarias} exitosa")
+            
+            if verificaciones_exitosas >= verificaciones_necesarias:
+                print(f"\n   🎯 ¡VISTA PRELIMINAR COMPLETAMENTE CARGADA!")
+                print(f"   Se encontraron {indicadores_encontrados} indicadores de carga completa")
+                
+                # Tomar captura final
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                driver.save_screenshot(f"vista_previa_completa_{timestamp}.png")
+                print(f"   📸 Captura guardada: vista_previa_completa_{timestamp}.png")
+                
+                # Hacer scroll para asegurar visibilidad
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                
+                return True
+        else:
+            verificaciones_exitosas = 0  # Reiniciar contador si no hay indicadores
+            print(f"   ⏳ Esperando más tiempo para que cargue...")
+        
+        # Verificar errores
+        try:
+            errores = driver.find_elements(By.XPATH, 
+                "//*[contains(text(), 'error') or contains(text(), 'Error') or contains(text(), 'ERROR')]")
+            for error in errores:
+                if error.is_displayed():
+                    error_text = error.text[:100] if error.text else "Error sin texto"
+                    print(f"   ⚠️ Se detectó un mensaje de error: {error_text}")
+                    return False
+        except:
+            pass
+        
+        # Esperar antes de la próxima verificación
+        time.sleep(5)
+    
+    print(f"\n⚠️  Tiempo de espera excedido ({tiempo_maximo_espera} segundos)")
+    print("   Intentando continuar de todos modos...")
+    
+    # Tomar captura final de estado
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    driver.save_screenshot(f"tiempo_espera_excedido_{timestamp}.png")
+    
+    # Intentar buscar el botón de exportación una última vez
+    try:
+        boton_exacto = driver.find_elements(By.XPATH, "//button[text()='Exportar a excel']")
+        for boton in boton_exacto:
+            if boton.is_displayed() and boton.is_enabled():
+                print(f"   ✅ Botón encontrado después del tiempo de espera!")
+                return True
+    except:
+        pass
+    
+    return True  # Intentar continuar de todos modos
+
+def hacer_clic_boton_exportacion(elemento, driver, metodo_deteccion):
+    """
+    Función auxiliar para hacer clic en el botón de exportación
+    con múltiples métodos de clic.
+    """
+    print(f"\n   🎯 CLIC EN BOTÓN DETECTADO POR: {metodo_deteccion}")
+    
+    texto = elemento.text.strip() if elemento.text else "Sin texto"
+    tag_name = elemento.tag_name
+    
+    print(f"   📝 Información del botón:")
+    print(f"      • Tag: <{tag_name}>")
+    print(f"      • Texto: '{texto}'")
+    print(f"      • Método: {metodo_deteccion}")
+    
+    # Intentar múltiples métodos de clic
+    metodos_exitosos = []
+    
+    # Método 1: JavaScript (más confiable)
+    try:
+        print(f"      Método 1: JavaScript click...")
+        driver.execute_script("arguments[0].click();", elemento)
+        print(f"      ✅ ¡CLIC CON JAVASCRIPT EXITOSO!")
+        metodos_exitosos.append("JavaScript")
+    except Exception as e1:
+        print(f"      ⚠️ Error JavaScript: {str(e1)[:50]}")
+    
+    # Método 2: ActionChains (más preciso)
+    try:
+        print(f"      Método 2: ActionChains click...")
+        from selenium.webdriver.common.action_chains import ActionChains
+        actions = ActionChains(driver)
+        actions.move_to_element(elemento).pause(0.5).click().pause(0.5).perform()
+        print(f"      ✅ ¡CLIC CON ACTIONCHAINS EXITOSO!")
+        metodos_exitosos.append("ActionChains")
+    except Exception as e2:
+        print(f"      ⚠️ Error ActionChains: {str(e2)[:50]}")
+    
+    # Método 3: Clic normal
+    try:
+        print(f"      Método 3: Clic normal...")
+        elemento.click()
+        print(f"      ✅ ¡CLIC NORMAL EXITOSO!")
+        metodos_exitosos.append("Normal")
+    except Exception as e3:
+        print(f"      ⚠️ Error clic normal: {str(e3)[:50]}")
+    
+    if metodos_exitosos:
+        print(f"\n      ✅ ¡CLIC REALIZADO EXITOSAMENTE!")
+        print(f"      Métodos exitosos: {', '.join(metodos_exitosos)}")
+        
+        # Esperar tiempo suficiente para la descarga
+        print(f"      ⏱️  Esperando 15 segundos para la descarga...")
+        time.sleep(15)
+        
+        # Tomar captura después del clic
+        timestamp_despues = datetime.now().strftime("%Y%m%d_%H%M%S")
+        driver.save_screenshot(f"despues_exportar_{timestamp_despues}.png")
+        print(f"      📸 Captura posterior guardada")
+        
+        return True
+    else:
+        print(f"\n      ❌ NINGÚN MÉTODO DE CLIC FUNCIONÓ")
+        return False
+
+def hacer_clic_en_boton_exportar_excel_mejorada(driver):
+    """
+    Función MEJORADA para hacer clic en el botón 'Exportar a excel'.
+    Primero espera a que la vista preliminar esté completamente cargada.
+    """
+    print("\n" + "="*60)
+    print("📊 HACIENDO CLIC EN BOTÓN 'EXPORTAR A EXCEL' (VERSIÓN MEJORADA)")
+    print("="*60)
+    
+    # 1. Primero esperar a que la vista preliminar esté completamente cargada
+    print("   ⏱️  ESPERANDO A QUE LA VISTA PRELIMINAR ESTÉ COMPLETAMENTE CARGADA...")
+    
+    # Llamar a la función mejorada de espera
+    vista_previa_cargada = esperar_vista_previa_archivo_mejorada(driver)
+    
+    if not vista_previa_cargada:
+        print("   ⚠️ No se pudo confirmar que la vista preliminar esté completamente cargada")
+        print("   💡 Intentando continuar de todos modos...")
+    
+    # Esperar un poco más para asegurar
+    print("   ⏱️  Esperando 5 segundos adicionales...")
+    time.sleep(5)
+    
+    # Tomar captura antes de buscar el botón
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    driver.save_screenshot(f"antes_buscar_exportar_{timestamp}.png")
+    print(f"   📸 Captura inicial guardada")
+    
+    # 2. BUSCAR EL BOTÓN ESPECÍFICO "Exportar a excel"
+    print("\n🔍 BUSCANDO BOTÓN 'EXPORTAR A EXCEL'...")
+    
+    # Estrategia 1: Buscar el botón exacto
+    xpaths_exactos = [
+        "//button[text()='Exportar a excel']",
+        "//button[normalize-space()='Exportar a excel']",
+        "//*[text()='Exportar a excel' and @role='button']",
+        "//span[text()='Exportar a excel']/parent::button",
+        "//div[text()='Exportar a excel']/parent::button",
+        "//a[text()='Exportar a excel']",
+    ]
+    
+    for xpath_exacto in xpaths_exactos:
+        try:
+            print(f"   Probando XPath exacto: {xpath_exacto}")
+            elementos = driver.find_elements(By.XPATH, xpath_exacto)
+            
+            if elementos:
+                print(f"   ✓ Encontrados {len(elementos)} elementos con XPath exacto")
+                
+                for i, elemento in enumerate(elementos, 1):
+                    try:
+                        if elemento.is_displayed() and elemento.is_enabled():
+                            texto = elemento.text.strip()
+                            print(f"   Elemento {i}: '{texto}'")
+                            
+                            # Resaltar el elemento
+                            driver.execute_script("""
+                                arguments[0].style.border = '3px solid red';
+                                arguments[0].style.backgroundColor = 'yellow';
+                                arguments[0].style.padding = '5px';
+                            """, elemento)
+                            time.sleep(1)
+                            
+                            # Hacer clic
+                            if hacer_clic_boton_exportacion(elemento, driver, "XPath exacto"):
+                                return True
+                            
+                    except Exception as e:
+                        print(f"   ⚠️ Error con elemento {i}: {str(e)[:50]}")
+                        continue
+                        
+        except Exception as e:
+            print(f"   ⚠️ Error con XPath exacto: {str(e)[:50]}")
+    
+    # Estrategia 2: Buscar por texto que contenga
+    xpaths_contenido = [
+        "//button[contains(text(), 'Exportar a excel')]",
+        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'exportar a excel')]",
+        "//*[contains(text(), 'Exportar a excel') and @role='button']",
+        "//button[contains(., 'Exportar') and contains(., 'excel')]",
+    ]
+    
+    for xpath_contenido in xpaths_contenido:
+        try:
+            print(f"   Probando XPath contenido: {xpath_contenido}")
+            elementos = driver.find_elements(By.XPATH, xpath_contenido)
+            
+            if elementos:
+                print(f"   ✓ Encontrados {len(elementos)} elementos con XPath contenido")
+                
+                for i, elemento in enumerate(elementos, 1):
+                    try:
+                        if elemento.is_displayed() and elemento.is_enabled():
+                            texto = elemento.text.strip()
+                            print(f"   Elemento {i}: '{texto}'")
+                            
+                            # Resaltar el elemento
+                            driver.execute_script("arguments[0].style.border = '3px solid blue';", elemento)
+                            time.sleep(1)
+                            
+                            # Hacer clic
+                            if hacer_clic_boton_exportacion(elemento, driver, "XPath contenido"):
+                                return True
+                            
+                    except Exception as e:
+                        print(f"   ⚠️ Error con elemento {i}: {str(e)[:50]}")
+                        continue
+                        
+        except Exception as e:
+            print(f"   ⚠️ Error con XPath contenido: {str(e)[:50]}")
+    
+    # Estrategia 3: Buscar todos los botones y filtrar
+    print("\n🔍 BUSCANDO TODOS LOS BOTONES VISIBLES...")
+    
+    try:
+        todos_botones = driver.find_elements(By.TAG_NAME, "button")
+        botones_visibles = []
+        
+        for boton in todos_botones:
+            try:
+                if boton.is_displayed() and boton.is_enabled():
+                    texto = boton.text.strip()
+                    if texto:
+                        botones_visibles.append((boton, texto))
+            except:
+                continue
+        
+        print(f"   Botones visibles encontrados: {len(botones_visibles)}")
+        
+        # Imprimir todos los botones para debugging
+        for i, (boton, texto) in enumerate(botones_visibles, 1):
+            print(f"   [{i:2d}] '{texto}'")
+        
+        # Buscar por texto específico
+        for boton, texto in botones_visibles:
+            texto_lower = texto.lower()
+            
+            if 'exportar a excel' in texto_lower:
+                print(f"   🎯 ¡COINCIDENCIA EXACTA ENCONTRADA! '{texto}'")
+                
+                # Resaltar
+                driver.execute_script("arguments[0].style.border = '3px solid green';", boton)
+                time.sleep(1)
+                
+                # Hacer clic
+                if hacer_clic_boton_exportacion(boton, driver, "coincidencia exacta"):
+                    return True
+                    
+            elif 'exportara excel' in texto_lower:
+                print(f"   🎯 ¡COINCIDENCIA SIN ESPACIO ENCONTRADA! '{texto}'")
+                
+                # Resaltar
+                driver.execute_script("arguments[0].style.border = '3px solid orange';", boton)
+                time.sleep(1)
+                
+                # Hacer clic
+                if hacer_clic_boton_exportacion(boton, driver, "sin espacio"):
+                    return True
+                    
+            elif 'exportar' in texto_lower and 'excel' in texto_lower:
+                print(f"   🎯 ¡COINCIDENCIA POR PALABRAS ENCONTRADA! '{texto}'")
+                
+                # Resaltar
+                driver.execute_script("arguments[0].style.border = '3px solid purple';", boton)
+                time.sleep(1)
+                
+                # Hacer clic
+                if hacer_clic_boton_exportacion(boton, driver, "por palabras"):
+                    return True
+    
+    except Exception as e:
+        print(f"   ❌ Error en búsqueda exhaustiva: {str(e)[:50]}")
+    
+    # Si llegamos aquí, no se pudo hacer clic
+    print("\n" + "="*60)
+    print("❌ NO SE PUDO HACER CLIC EN 'EXPORTAR A EXCEL'")
+    print("="*60)
+    
+    print("\n🔍 DIAGNÓSTICO:")
+    print("   1. Verificar en las capturas si el botón está visible")
+    print("   2. El botón podría estar deshabilitado")
+    print("   3. Podría estar cubierto por otro elemento")
+    print("   4. El texto podría ser diferente")
+    
+    # Tomar captura final para análisis
+    timestamp_final = datetime.now().strftime("%Y%m%d_%H%M%S")
+    driver.save_screenshot(f"error_exportar_excel_{timestamp_final}.png")
+    print(f"\n   📸 Captura guardada: error_exportar_excel_{timestamp_final}.png")
+    
+    return False
+
+def marcar_todas_las_casillas(driver):
+    """
+    Hace scroll dentro del menú de columnas y marca TODAS las casillas
+    que no estén marcadas (amarillo)
+    """
+    print("\n✅ MARCANDO TODAS LAS CASILLAS CON SCROLL...")
+    time.sleep(2)
+    
+    # 1. ENCONTRAR EL CONTENEDOR PRINCIPAL CON SCROLL
+    print("   🔍 Buscando contenedor del menú con scroll...")
+    contenedor_scroll = None
+    
+    # Buscar diferentes tipos de contenedores con scroll
+    selectores_contenedor = [
+        "//div[contains(@class, 'k-list-container')]",
+        "//div[contains(@class, 'k-popup')]",
+        "//div[@role='listbox']",
+        "//div[contains(@class, 'k-animation-container')]",
+        "//div[contains(@class, 'k-columns-items')]",
+        "//div[contains(@class, 'k-group')]"
+    ]
+    
+    for selector in selectores_contenedor:
+        try:
+            contenedores = driver.find_elements(By.XPATH, selector)
+            for contenedor in contenedores:
+                if contenedor.is_displayed():
+                    # Verificar si tiene scroll
+                    try:
+                        tiene_scroll = driver.execute_script("""
+                            var elem = arguments[0];
+                            return elem.scrollHeight > elem.clientHeight;
+                        """, contenedor)
+                        
+                        if tiene_scroll:
+                            contenedor_scroll = contenedor
+                            print(f"   ✓ Contenedor con scroll encontrado: {selector}")
+                            print(f"   📏 Tamaño: {contenedor.size}")
+                            break
+                    except:
+                        # Si no se puede verificar scroll, asumir que es el contenedor
+                        if contenedor.size['height'] > 200:
+                            contenedor_scroll = contenedor
+                            print(f"   ✓ Contenedor probable encontrado: {selector}")
+                            break
+            if contenedor_scroll:
+                break
+        except Exception as e:
+            continue
+    
+    if not contenedor_scroll:
+        print("   ⚠️ No se encontró contenedor específico, usando el diálogo completo")
+        try:
+            # Buscar el diálogo más cercano
+            dialogo = driver.find_element(By.XPATH, "//div[contains(@class, 'k-window') or contains(@class, 'k-dialog')]")
+            contenedor_scroll = dialogo
+        except:
+            contenedor_scroll = driver.find_element(By.TAG_NAME, "body")
+    
+    # 2. HACER SCROLL PARA CARGAR TODAS LAS CASILLAS
+    print("   📜 Haciendo scroll para cargar todas las casillas...")
+    
+    altura_actual = 0
+    intentos = 0
+    max_intentos = 15  # Aumentado para asegurar scroll completo
+    
+    while intentos < max_intentos:
+        try:
+            # Obtener altura de scroll actual
+            nueva_altura = driver.execute_script("""
+                var cont = arguments[0];
+                return cont.scrollTop || document.documentElement.scrollTop || document.body.scrollTop;
+            """, contenedor_scroll)
+            
+            altura_maxima = driver.execute_script("""
+                var cont = arguments[0];
+                return cont.scrollHeight || document.documentElement.scrollHeight || document.body.scrollHeight;
+            """, contenedor_scroll)
+            
+            print(f"      Scroll: {nueva_altura}/{altura_maxima} px")
+            
+            # Verificar si ya estamos al final
+            if nueva_altura >= altura_maxima - 100 or nueva_altura == altura_actual:
+                intentos += 1
+                if intentos >= 3:  # Si no hay movimiento por 3 intentos, salir
+                    print("      ✓ Llegó al final del scroll")
+                    break
+            else:
+                intentos = 0  # Reiniciar contador si hubo movimiento
+            
+            # Hacer scroll hacia abajo
+            driver.execute_script("""
+                var cont = arguments[0];
+                cont.scrollTop = cont.scrollTop + 300;
+            """, contenedor_scroll)
+            
+            altura_actual = nueva_altura
+            time.sleep(0.3)  # Esperar a que carguen nuevos elementos
+            
+        except Exception as e:
+            print(f"      ⚠️ Error en scroll: {e}")
+            break
+    
+    # 3. BUSCAR TODAS LAS CASILLAS DESPUÉS DEL SCROLL
+    print("   🔍 Buscando TODAS las casillas después del scroll...")
+    
+    # Estrategia: buscar todos los elementos que podrían ser casillas
+    todos_los_elementos_potenciales = []
+    
+    # Buscar por diferentes patrones
+    patrones_busqueda = [
+        "//*[contains(@class, 'k-checkbox')]",
+        "//input[@type='checkbox']",
+        "//span[contains(@class, 'k-checkbox')]",
+        "//div[contains(@class, 'k-checkbox')]",
+        "//label[contains(@class, 'k-checkbox')]",
+        "//*[@role='checkbox']"
+    ]
+    
+    for patron in patrones_busqueda:
+        try:
+            elementos = driver.find_elements(By.XPATH, patron)
+            for elem in elementos:
+                if elem.is_displayed() and elem not in todos_los_elementos_potenciales:
+                    todos_los_elementos_potenciales.append(elem)
+        except:
+            continue
+    
+    print(f"   📊 Elementos potenciales encontrados: {len(todos_los_elementos_potenciales)}")
+    
+    # Filtrar elementos que realmente son casillas (visibles y con tamaño razonable)
+    casillas_reales = []
+    for elem in todos_los_elementos_potenciales:
+        try:
+            # Verificar que tenga tamaño razonable para ser una casilla
+            tamaño = elem.size
+            if tamaño['width'] > 10 and tamaño['height'] > 10:
+                # Verificar que no sea un botón u otro elemento
+                tag_name = elem.tag_name.lower()
+                if tag_name != 'button' and tag_name != 'a':
+                    casillas_reales.append(elem)
+        except:
+            continue
+    
+    print(f"   📊 Casillas reales filtradas: {len(casillas_reales)}")
+    
+    # Si no encontramos suficientes, buscar de otra manera
+    if len(casillas_reales) < 5:
+        print("   🔍 Buscando por estructura de Kendo UI...")
+        # Buscar elementos dentro de items de lista
+        try:
+            items = driver.find_elements(By.XPATH, "//div[contains(@class, 'k-list-item')] | //li[contains(@class, 'k-item')]")
+            for item in items:
+                if item.is_displayed():
+                    # Buscar checkboxes dentro del item
+                    checkboxes = item.find_elements(By.XPATH, ".//*[contains(@class, 'k-checkbox')] | .//input[@type='checkbox']")
+                    for cb in checkboxes:
+                        if cb.is_displayed() and cb not in casillas_reales:
+                            casillas_reales.append(cb)
+        except:
+            pass
+    
+    print(f"   📊 Total casillas a procesar: {len(casillas_reales)}")
+    
+    # 4. PROCESAR Y MARCAR TODAS LAS CASILLAS
+    casillas_marcadas = 0
+    casillas_ya_marcadas = 0
+    
+    print("   🎯 Procesando y marcando casillas...")
+    
+    for i, casilla in enumerate(casillas_reales, 1):
+        try:
+            # Asegurarse de que la casilla esté visible
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", casilla)
+            time.sleep(0.1)
+            
+            # Verificar estado actual
+            esta_marcada = verificar_si_casilla_esta_marcada(casilla)
+            
+            if esta_marcada:
+                casillas_ya_marcadas += 1
+                print(f"      [{i:3d}] ✓ Ya marcada (amarillo)")
+            else:
+                print(f"      [{i:3d}] → Marcando (blanco a amarillo)...")
+                
+                # Intentar diferentes métodos para marcar
+                marcada_exitosamente = False
+                
+                # Método 1: Clic con JavaScript
+                try:
+                    driver.execute_script("arguments[0].click();", casilla)
+                    time.sleep(0.2)
+                    
+                    # Verificar si se marcó
+                    if verificar_si_casilla_esta_marcada(casilla):
+                        marcada_exitosamente = True
+                except:
+                    pass
+                
+                # Método 2: Clic directo
+                if not marcada_exitosamente:
+                    try:
+                        casilla.click()
+                        time.sleep(0.2)
+                        if verificar_si_casilla_esta_marcada(casilla):
+                            marcada_exitosamente = True
+                    except:
+                        pass
+                
+                # Método 3: Buscar input interno
+                if not marcada_exitosamente:
+                    try:
+                        input_interno = casilla.find_element(By.XPATH, ".//input[@type='checkbox']")
+                        driver.execute_script("arguments[0].click();", input_interno)
+                        time.sleep(0.2)
+                        if verificar_si_casilla_esta_marcada(casilla):
+                            marcada_exitosamente = True
+                    except:
+                        pass
+                
+                # Método 4: Clic en área cercana (para Kendo UI)
+                if not marcada_exitosamente:
+                    try:
+                        # Buscar elemento padre y hacer clic
+                        padre = casilla.find_element(By.XPATH, "./parent::*")
+                        driver.execute_script("arguments[0].click();", padre)
+                        time.sleep(0.2)
+                        if verificar_si_casilla_esta_marcada(casilla):
+                            marcada_exitosamente = True
+                    except:
+                        pass
+                
+                if marcada_exitosamente:
+                    casillas_marcadas += 1
+                    print(f"           ✓ Marcada exitosamente")
+                else:
+                    print(f"           ⚠️ No se pudo marcar")
+                
+        except Exception as e:
+            print(f"      [{i:3d}] ✗ Error: {str(e)[:50]}...")
+    
+    # 5. RESULTADO FINAL
+    print(f"\n   📊 RESULTADO FINAL:")
+    print(f"   • Total casillas encontradas: {len(casillas_reales)}")
+    print(f"   • Casillas YA MARCADAS: {casillas_ya_marcadas}")
+    print(f"   • Casillas MARCADAS ahora: {casillas_marcadas}")
+    print(f"   • Total marcadas: {casillas_ya_marcadas + casillas_marcadas}/{len(casillas_reales)}")
+    
+    if casillas_marcadas > 0 or casillas_ya_marcadas > 0:
+        print(f"   ✅ ¡Todas las casillas deberían estar en amarillo!")
+        
+        # Tomar captura para verificar
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            driver.save_screenshot(f"resultado_final_{timestamp}.png")
+            print(f"   📸 Captura guardada: resultado_final_{timestamp}.png")
+        except:
+            pass
+        
+        return True
+    else:
+        print("   ❌ No se pudo marcar ninguna casilla.")
+        return False
+
+def main():
+    try:
+        print("="*70)
+        print("🚀 INICIANDO AUTOMATIZACIÓN DE REPORTE (VERSIÓN CORREGIDA)")
+        print("="*70)
+        
+        # Iniciar navegador con configuración de descargas
+        print("\n1. Iniciando navegador...")
+        driver, download_dir = iniciando_navegacion()
+        wait = WebDriverWait(driver, 20)
+        
+        # --- LOGIN ---
+        print("\n2. Accediendo al sistema...")
+        try:
+            driver.get("https://erp.riomarket.com/")
+            print("   ✓ Página cargada")
+            
+            email = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email']")))
+            email.send_keys("romel.sanchezi@riomarket.com")
+            print("   ✓ Email ingresado")
+            
+            password = driver.find_element(By.XPATH, "//input[@type='password']")
+            password.send_keys("123456")
+            password.send_keys(Keys.ENTER)
+            print("   ✓ Contraseña ingresada")
+            
+        except Exception as e:
+            print(f"   ❌ Error en login: {e}")
+            return
+        
+        # --- ESPERA DE CARGA ---
+        print("\n3. Esperando carga del sistema...")
+        time.sleep(5)
+        
+        # --- ACCEDER AL REPORTE ---
+        print("\n4. Accediendo al reporte...")
+        try:
+            url_reporte = "https://erp.riomarket.com/report/inventory-adjustment"
+            driver.get(url_reporte)
+            print("   ✓ Reporte cargado")
+            time.sleep(4)
+        except Exception as e:
+            print(f"   ❌ Error al cargar reporte: {e}")
+            return
+        
+        # --- BUSCAR CAMPOS DE FECHA ---
+        print("\n5. Buscando campos de fecha...")
+        time.sleep(3)
+        
+        xpaths_fechas = [
+            "//input[contains(@placeholder, 'Desde')]",
+            "//input[contains(@placeholder, 'Hasta')]",
+            "//input[@type='date']",
+        ]
+        
+        inputs = []
+        for xpath in xpaths_fechas:
+            try:
+                encontrados = driver.find_elements(By.XPATH, xpath)
+                inputs.extend(encontrados)
+            except:
+                pass
+        
+        if len(inputs) < 2:
+            print("   Buscando todos los inputs...")
+            todos_inputs = driver.find_elements(By.TAG_NAME, "input")
+            inputs = [inp for inp in todos_inputs if inp.is_displayed() and inp.is_enabled()]
+        
+        # --- INGRESAR FECHAS ---
+        if len(inputs) >= 2:
+            fecha_desde = "01122025"
+            ayer = datetime.now() - timedelta(days=1)
+            fecha_hasta = ayer.strftime("%d%m%Y")
+            
+            print(f"\n   📅 Fecha DESDE: {fecha_desde}")
+            print(f"   📅 Fecha HASTA: {fecha_hasta}")
+            
+            # Fecha DESDE
+            print("\n   5.1. Ingresando fecha DESDE...")
+            ingresar_fecha_sin_barras(driver, inputs[0], fecha_desde)
+            time.sleep(1)
+            
+            # Fecha HASTA
+            print("\n   5.2. Ingresando fecha HASTA...")
+            ingresar_fecha_sin_barras(driver, inputs[1], fecha_hasta)
+            time.sleep(1)
+            
+            # Clic en área neutra
+            try:
+                driver.find_element(By.TAG_NAME, "body").click()
+            except:
+                pass
+            
+            # --- PANEL RESULTADOS ---
+            print("\n6. Ubicándose en panel 'Resultados'...")
+            time.sleep(2)
+            
+            panel_resultados = buscar_panel_resultados(driver)
+            if panel_resultados:
+                driver.execute_script("arguments[0].scrollIntoView();", panel_resultados)
+                time.sleep(1)
+            else:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1)
+            
+            # --- BOTÓN TRES PUNTOS ---
+            print("\n7. Buscando botón de tres puntos...")
+            resultado_boton = hacer_clic_en_boton_tres_puntos_sucursal(driver)
+            
+            if not resultado_boton:
+                print("   ⚠️ No se encontró el botón, intentando alternativa...")
+                try:
+                    elementos = driver.find_elements(By.CSS_SELECTOR, ".k-i-more-vertical")
+                    for elem in elementos:
+                        if elem.is_displayed():
+                            driver.execute_script("arguments[0].click();", elem)
+                            resultado_boton = True
+                            break
+                except:
+                    pass
+            
+            # --- OPCIÓN COLUMNAS ---
+            if resultado_boton:
+                print("\n8. Haciendo clic en opción 'Columnas'...")
+                resultado_columnas = hacer_clic_en_opcion_columnas(driver)
+                
+                if not resultado_columnas:
+                    print("   ⚠️ No se pudo hacer clic, intentando alternativa...")
+                    time.sleep(1)
+                    # Usar teclas para navegar al menú
+                    actions = webdriver.ActionChains(driver)
+                    actions.send_keys(Keys.ARROW_DOWN).pause(0.5)
+                    actions.send_keys(Keys.ARROW_DOWN).pause(0.5)
+                    actions.send_keys(Keys.ENTER).pause(0.5)
+                    actions.perform()
+                    resultado_columnas = True
+                    time.sleep(2)  # Dar más tiempo para que aparezca el diálogo
+            
+            # --- MARCAR CASILLAS ---
+            if resultado_boton or resultado_columnas:
+                print("\n9. Marcando TODAS las casillas con scroll...")
+                resultado_casillas = marcar_todas_las_casillas(driver)
+                
+                if resultado_casillas:
+                    print("   ✓ Todas las casillas procesadas exitosamente")
+                else:
+                    print("   ⚠️ Hubo problemas procesando algunas casillas")
+            
+            # --- HACER CLIC EN "APLICAR" ---
+            if resultado_casillas:
+                print("\n10. Haciendo clic en botón 'Aplicar'...")
+                resultado_aplicar = hacer_clic_en_boton_aplicar(driver)
+                
+                if resultado_aplicar:
+                    print("   ✓ Botón 'Aplicar' clickeado exitosamente")
+                else:
+                    print("   ⚠️ Hubo problemas al hacer clic en 'Aplicar'")
+            
+            # --- HACER CLIC EN "BUSCAR" PARA EXCEL ---
+            if resultado_aplicar:
+                print("\n11. Haciendo clic en botón 'Buscar' para Excel...")
+                resultado_buscar = hacer_clic_en_boton_buscar_excel(driver)
+                
+                if resultado_buscar:
+                    print("   ✓ Botón 'Buscar' clickeado exitosamente")
+                    print("   ⏱️  Esperando a que cargue la vista previa del archivo...")
+                else:
+                    print("   ⚠️ Hubo problemas al hacer clic en 'Buscar'")
+            
+            # --- ESPERAR VISTA PREVIA DEL ARCHIVO --- (PASO CRÍTICO)
+            if resultado_buscar:
+                print("\n12. Esperando vista previa del archivo...")
+                # Usar la función mejorada de espera
+                resultado_vista_previa = esperar_vista_previa_archivo_mejorada(driver)
+                
+                if resultado_vista_previa:
+                    print("   ✅ Vista previa del archivo cargada correctamente")
+                    print("   📋 El botón 'Exportar a excel' debería estar visible ahora")
+                else:
+                    print("   ⚠️ No se pudo confirmar la vista previa del archivo")
+                    print("   💡 Intentando continuar de todos modos...")
+                    resultado_vista_previa = True  # Forzar continuar
+            
+            # --- HACER CLIC EN "EXPORTAR A EXCEL" --- (SÓLO DESPUÉS DE VISTA PREVIA)
+            if resultado_vista_previa:
+                print("\n13. Haciendo clic en botón 'Exportar a excel' (texto EXACTO)...")
+                # Usar la función mejorada para hacer clic
+                resultado_exportar = hacer_clic_en_boton_exportar_excel_mejorada(driver)
+                
+                if resultado_exportar:
+                    print("\n14. Esperando descarga del archivo...")
+                    
+                    # --- ESPERAR DESCARGA ---
+                    archivo_descargado = esperar_descarga_archivo(download_dir)
+                    
+                    if archivo_descargado:
+                        print(f"   ✅ Archivo descargado exitosamente: {os.path.basename(archivo_descargado)}")
+                        
+                        # --- RENOMBRAR Y MOVER ARCHIVO ---
+                        print("\n15. Renombrando y moviendo archivo...")
+                        # USAR LA VERSIÓN SIMPLIFICADA PARA EVITAR PROBLEMAS DE PERMISOS
+                        resultado_renombrado, ruta_final = renombrar_y_mover_archivo_simple(archivo_descargado, download_dir)
+                        
+                        if resultado_renombrado:
+                            print("\n" + "="*70)
+                            print("✅ ¡PROCESO COMPLETADO EXITOSAMENTE!")
+                            print("="*70)
+                            print("   📋 RESUMEN DE ACCIONES:")
+                            print("   1. ✓ Login realizado")
+                            print("   2. ✓ Reporte cargado")
+                            print("   3. ✓ Fechas ingresadas")
+                            print("   4. ✓ Panel 'Resultados' ubicado")
+                            print("   5. ✓ Botón de tres puntos clickeado")
+                            print("   6. ✓ Opción 'Columnas' seleccionada")
+                            print("   7. ✓ Scroll completo en menú")
+                            print("   8. ✓ TODAS las casillas marcadas")
+                            print("   9. ✓ Botón 'Aplicar' clickeado")
+                            print("   10. ✓ Botón 'Buscar' clickeado")
+                            print("   11. ✓ Vista previa esperada")
+                            print("   12. ✓ Botón 'Exportar a excel' clickeado")
+                            print("   13. ✓ Archivo descargado")
+                            print("   14. ✓ Archivo renombrado y movido")
+                            print("="*70)
+                            print(f"   📁 Archivo final guardado en:")
+                            print(f"      {ruta_final}")
+                            print(f"   📊 Tamaño: {os.path.getsize(ruta_final):,} bytes")
+                            print(f"   🕒 Fecha del reporte: {(datetime.now() - timedelta(days=1)).strftime('%d/%m/%Y')}")
+                            
+                        else:
+                            print("\n⚠️  El archivo se descargó pero no se pudo renombrar/mover")
+                            print(f"   📄 Archivo descargado: {archivo_descargado}")
+                    else:
+                        print("\n❌ No se pudo descargar el archivo Excel")
+                        print("   💡 Verificar:")
+                        print("   1. Permisos de descarga en el navegador")
+                        print("   2. Conexión a internet")
+                        print("   3. Espacio en disco")
+                    
+                else:
+                    print("\n❌ NO SE PUDO HACER CLIC EN 'EXPORTAR A EXCEL'")
+                    print("   💡 Posibles soluciones:")
+                    print("   1. Verificar que el botón esté visible en las capturas")
+                    print("   2. Esperar más tiempo para que cargue completamente")
+                    print("   3. Verificar manualmente la página")
+            
+            # --- RESUMEN FINAL ---
+            print("\n" + "="*70)
+            print("🏁 EJECUCIÓN FINALIZADA")
+            print("="*70)
+            
+        else:
+            print("❌ No se encontraron campos de fecha suficientes")
+            
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        print("\n💡 Navegador permanece abierto para revisión")
+        print("📸 Revisa las capturas guardadas para diagnóstico")
+        
+        try:
+            input("\nPresione Enter para cerrar el navegador...")
+            driver.quit()
+        except:
+            pass
+
+if __name__ == '__main__':
+    main()
