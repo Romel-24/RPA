@@ -1,0 +1,520 @@
+"""
+Agente de IA - Analizador de carpeta (estilo "chismoso")
+========================================================
+Navega a una carpeta, lee conversaciones exportadas de WhatsApp (.txt) e imágenes
+de esa misma conversación. Genera un documento Word con un resumen en tono
+narrativo/chismoso: de qué hablaban y cómo se relacionan las fotos con la plática.
+No copia el contenido tal cual.
+
+Requisitos:
+- pip install -r requirements_botai.txt
+- Para OCR en imágenes: instalar Tesseract OCR en el sistema
+  (https://github.com/tesseract-ocr/tesseract) y opcionalmente idioma 'spa'.
+"""
+
+import os
+import re
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+
+# Dependencias opcionales para imágenes y Word
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+
+try:
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+
+# Extensiones soportadas para imágenes
+IMAGEN_EXTENSIONES = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'}
+TXT_EXTENSION = '.txt'
+
+# Patrones comunes para exportación de chat de WhatsApp
+# Formatos: "DD/MM/YYYY, HH:MM - Nombre: mensaje" o "[DD/MM/YYYY, HH:MM:SS] Nombre: mensaje"
+PATRON_WHATSAPP = re.compile(
+    r"^\[?(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*[\]\s\-]+\s*(.+?):\s*(.*)$",
+    re.MULTILINE
+)
+# Alternativa sin fecha al inicio (línea que solo tiene "Nombre: mensaje" después de otra)
+PATRON_SIMPLE = re.compile(r"^([^:]+):\s*(.*)$", re.MULTILINE)
+
+# Palabras vacías en español (para no usarlas como "temas")
+STOPWORDS_ES = {
+    "que", "de", "la", "el", "en", "y", "a", "los", "un", "por", "con", "no", "una", "su", "para",
+    "al", "lo", "como", "más", "pero", "sus", "le", "ya", "o", "fue", "este", "hay", "si", "porque",
+    "esta", "entre", "cuando", "muy", "sin", "sobre", "ser", "tiene", "me", "hasta", "hay", "donde",
+    "han", "quien", "desde", "todo", "nos", "durante", "estados", "uno", "les", "ni", "contra",
+    "otros", "ese", "eso", "ante", "ellos", "e", "esto", "mí", "antes", "algunos", "qué", "unos",
+    "yo", "otro", "también", "es", "son", "se", "te", "tu", "aquí", "así", "bien", "mal", "sí",
+    "jaja", "jajaja", "ok", "vale", "ah", "eh", "um", "ya", "pues", "entonces", "pero", "como",
+}
+
+
+def _parsear_chat_whatsapp(texto: str) -> list[dict]:
+    """
+    Parsea un texto de exportación de WhatsApp y devuelve lista de mensajes.
+    Cada mensaje: {"fecha": str, "hora": str, "autor": str, "mensaje": str}
+    """
+    lineas = texto.splitlines()
+    mensajes = []
+    for linea in lineas:
+        linea = linea.strip()
+        if not linea:
+            continue
+        m = PATRON_WHATSAPP.match(linea)
+        if m:
+            mensajes.append({
+                "fecha": m.group(1),
+                "hora": m.group(2),
+                "autor": m.group(3).strip(),
+                "mensaje": m.group(4).strip()
+            })
+        else:
+            # Si no coincide, puede ser continuación del mensaje anterior
+            if mensajes and not PATRON_SIMPLE.match(linea) or (mensajes and ":" not in linea[:50]):
+                mensajes[-1]["mensaje"] += "\n" + linea
+            else:
+                simple = PATRON_SIMPLE.match(linea)
+                if simple:
+                    mensajes.append({
+                        "fecha": "",
+                        "hora": "",
+                        "autor": simple.group(1).strip(),
+                        "mensaje": simple.group(2).strip()
+                    })
+    return mensajes
+
+
+def _limpiar_texto_ocr(texto: str) -> str:
+    """Normaliza texto de OCR: quita ruido y líneas vacías repetidas."""
+    if not texto or not texto.strip():
+        return ""
+    lineas = [ln.strip() for ln in texto.splitlines() if ln.strip()]
+    # Quitar líneas que son solo números o símbolos sueltos
+    lineas = [ln for ln in lineas if len(ln) > 1 and not re.match(r"^[\d\s\.\,\-\:\;\*]+$", ln)]
+    return " ".join(lineas)
+
+
+def _extraer_frases_significativas(mensajes: list[dict], min_long: int = 20) -> list[tuple[str, str]]:
+    """Devuelve lista de (autor, mensaje) con mensajes que tienen contenido sustancial."""
+    resultado = []
+    for m in mensajes:
+        msg = (m.get("mensaje") or "").strip()
+        if len(msg) < min_long:
+            continue
+        # Descartar solo emojis/risas repetidas
+        sin_espacios = msg.replace(" ", "").replace("\n", "")
+        if all(c in "jajahae😀😂🤣👍👋.\n\t " for c in sin_espacios[:30]):
+            continue
+        autor = (m.get("autor") or "Alguien").strip()
+        resultado.append((autor, msg))
+    return resultado
+
+
+def _extraer_temas_conversacion(mensajes: list[dict]) -> list[str]:
+    """Extrae temas principales: palabras relevantes (no stopwords) más repetidas."""
+    todas = []
+    for m in mensajes:
+        for p in re.findall(r"\b[a-zA-ZáéíóúÁÉÍÓÚñÑ]+\b", m.get("mensaje", "")):
+            p = p.lower()
+            if len(p) > 2 and p not in STOPWORDS_ES:
+                todas.append(p)
+    return [p for p, _ in Counter(todas).most_common(15)]
+
+
+def _resumir_flujo_conversacion(mensajes: list[dict]) -> list[str]:
+    """
+    Analiza el orden de la conversación y genera frases narrativas: quién dijo qué,
+    preguntas, respuestas, y bloques temáticos.
+    """
+    frases = []
+    if not mensajes:
+        return frases
+
+    participantes = list(dict.fromkeys(m["autor"] for m in mensajes if m.get("autor")))
+    n_participantes = len(participantes)
+
+    # Bloques: agrupar mensajes consecutivos del mismo autor
+    bloques = []
+    actual = None
+    for m in mensajes:
+        autor = (m.get("autor") or "").strip()
+        msg = (m.get("mensaje") or "").strip()
+        if not autor:
+            continue
+        if actual and actual["autor"] == autor:
+            actual["mensajes"].append(msg)
+        else:
+            actual = {"autor": autor, "mensajes": [msg] if msg else []}
+            if actual["mensajes"]:
+                bloques.append(actual)
+
+    # Resumen por bloques significativos
+    for i, bloque in enumerate(bloques):
+        autor = bloque["autor"]
+        textos = [t for t in bloque["mensajes"] if len(t) > 10]
+        if not textos:
+            continue
+        # Una o dos frases representativas del bloque
+        representativo = textos[0]
+        if len(representativo) > 180:
+            representativo = representativo[:177] + "..."
+        if i == 0:
+            frases.append(f"Para empezar, {autor} comenta: «{representativo}»")
+        else:
+            frases.append(f"Luego {autor} dice: «{representativo}»")
+
+    # Detectar preguntas y acuerdos
+    preguntas = []
+    acuerdos = []
+    for m in mensajes:
+        msg = (m.get("mensaje") or "").strip()
+        if "?" in msg or "¿" in msg:
+            frag = msg[:150].strip()
+            if len(msg) > 150:
+                frag += "..."
+            if frag and (m.get("autor") or "").strip():
+                preguntas.append(((m.get("autor") or "").strip(), frag))
+        for patron in ("quedamos", "entonces vamos", "ok entonces", "dale ", "va ", "listo ", "acordamos"):
+            if patron in msg.lower():
+                acuerdos.append(msg[:120])
+
+    if preguntas:
+        quien, q = preguntas[0]
+        frases.append(f"En un momento {quien} pregunta algo como: «{q}»")
+    if acuerdos:
+        frases.append(f"En la plática llegan a acuerdos o cierres del tipo: «{acuerdos[0]}»")
+
+    return frases
+
+
+def _describir_imagen_para_resumen(img: dict) -> str:
+    """
+    Genera una descripción precisa del contenido de la imagen para el resumen,
+    usando OCR y metadatos.
+    """
+    nombre = img.get("nombre", "imagen")
+    texto_img = _limpiar_texto_ocr((img.get("texto_extraido") or ""))
+    dim = (img.get("metadata") or {}).get("dimensiones", "")
+
+    if texto_img:
+        # Resumir: primeras frases o líneas con contenido (máx ~250 caracteres)
+        if len(texto_img) > 280:
+            texto_img = texto_img[:277].rsplit(" ", 1)[0] + "..."
+        return f"En la imagen «{nombre}» se ve o se lee lo siguiente: «{texto_img}»."
+    return f"La imagen «{nombre}» ({dim}) forma parte de lo que compartieron en el chat (no se detectó texto legible en ella)."
+
+
+def _palabras_clave(texto: str) -> set[str]:
+    """Extrae palabras significativas de un texto para cruzar con la conversación."""
+    palabras = set()
+    for p in re.findall(r"\b[a-zA-ZáéíóúÁÉÍÓÚñÑ]+\b", (texto or "").lower()):
+        if len(p) > 2 and p not in STOPWORDS_ES:
+            palabras.add(p)
+    return palabras
+
+
+def _relacionar_imagen_con_chat(img: dict, temas_chat: list[str], mensajes_planos: str) -> str:
+    """
+    Relaciona el contenido de una imagen (OCR) con lo que se hablaba en el chat.
+    """
+    texto_img = _limpiar_texto_ocr((img.get("texto_extraido") or ""))
+    if not texto_img:
+        return ""
+
+    palabras_imagen = _palabras_clave(texto_img)
+    palabras_chat = set(temas_chat) | _palabras_clave(mensajes_planos)
+    interseccion = palabras_imagen & palabras_chat
+    if interseccion:
+        temas_relacionados = ", ".join(list(interseccion)[:5])
+        return f" Esta imagen encaja con lo que hablaban sobre: {temas_relacionados}."
+
+    return ""
+
+
+def _construir_resumen_chismoso(mensajes: list[dict], imagenes: list[dict]) -> str:
+    """
+    Genera un resumen en tono "chismoso" pero preciso: analiza a fondo la conversación
+    (qué dicen, quién, en qué orden) y describe cada imagen y su relación con el chat.
+    """
+    partes = []
+
+    if not mensajes and not imagenes:
+        return "No había nada que analizar: ni mensajes ni fotos en esta carpeta."
+
+    participantes = list(dict.fromkeys(m["autor"] for m in mensajes if m.get("autor")))
+    temas = _extraer_temas_conversacion(mensajes)
+    flujo = _resumir_flujo_conversacion(mensajes)
+    mensajes_planos = " ".join(m.get("mensaje", "") for m in mensajes)
+
+    # —— Introducción y participantes ——
+    intro = "En esta conversación participan "
+    if not participantes:
+        intro += "varias personas (los nombres no se identificaron bien). "
+    elif len(participantes) == 1:
+        intro += f"{participantes[0]}. "
+    else:
+        intro += ", ".join(participantes[:-1]) + " y " + participantes[-1] + ". "
+    intro += f"En total hay {len(mensajes)} mensajes. "
+    partes.append(intro)
+
+    # —— De qué hablan (temas) ——
+    if temas:
+        partes.append("Los temas que más salen en la plática son: " + ", ".join(temas[:10]) + ". ")
+
+    # —— Flujo: quién dijo qué y en qué orden ——
+    if flujo:
+        partes.append("Resumiendo lo que se dice: ")
+        for f in flujo[:8]:  # hasta 8 frases de flujo
+            partes.append(f + " ")
+        partes.append(" ")
+
+    # —— Frases significativas adicionales (más detalle) ——
+    frases_sig = _extraer_frases_significativas(mensajes)
+    if len(frases_sig) > 2:
+        extra = []
+        for autor, msg in frases_sig[2:6]:
+            frag = msg[:100] + ("..." if len(msg) > 100 else "")
+            extra.append(f"{autor} menciona: «{frag}»")
+            if len(extra) >= 2:
+                break
+        for e in extra:
+            partes.append(e + " ")
+
+    # —— Imágenes: descripción precisa y relación con la conversación ——
+    if imagenes:
+        partes.append(
+            f"En la carpeta hay {len(imagenes)} imagen(es) que pertenecen a esta conversación. "
+        )
+        for img in imagenes[:12]:
+            desc = _describir_imagen_para_resumen(img)
+            relacion = _relacionar_imagen_con_chat(img, temas, mensajes_planos)
+            partes.append(desc + relacion + " ")
+        if len(imagenes) > 12:
+            partes.append(f"Además hay {len(imagenes) - 12} imagen(es) más en la carpeta. ")
+
+    return "".join(partes).strip()
+
+
+class AgenteAnalizador:
+    """
+    Agente que examina una carpeta con chat de WhatsApp (.txt) e imágenes.
+    Genera un resumen en tono "chismoso": qué se hablaba y cómo encajan las fotos.
+    """
+
+    def __init__(self, ruta_origen: str, ruta_destino_word: str):
+        """
+        Args:
+            ruta_origen: Ruta absoluta o relativa de la carpeta a analizar.
+            ruta_destino_word: Ruta de la carpeta donde se guardará el .docx (o ruta completa del archivo).
+        """
+        self.ruta_origen = Path(ruta_origen).resolve()
+        self.ruta_destino = Path(ruta_destino_word).resolve()
+        self.datos_imagenes = []
+        self.datos_textos = []
+
+    def _validar_ruta_origen(self) -> bool:
+        """Comprueba que la carpeta de origen exista y sea accesible."""
+        if not self.ruta_origen.exists():
+            raise FileNotFoundError(f"La carpeta de origen no existe: {self.ruta_origen}")
+        if not self.ruta_origen.is_dir():
+            raise NotADirectoryError(f"La ruta no es una carpeta: {self.ruta_origen}")
+        return True
+
+    def _asegurar_carpeta_destino(self):
+        """Crea la carpeta de destino si no existe (si ruta_destino es carpeta)."""
+        if self.ruta_destino.suffix.lower() == '.docx':
+            self.ruta_destino.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self.ruta_destino.mkdir(parents=True, exist_ok=True)
+
+    def examinar_imagenes(self) -> list:
+        """
+        Recorre la carpeta, identifica archivos de imagen y los analiza.
+        Obtiene metadatos y, si está disponible, texto por OCR (pytesseract).
+        """
+        if not PIL_AVAILABLE:
+            return []
+
+        self.datos_imagenes = []
+        for archivo in sorted(self.ruta_origen.iterdir()):
+            if not archivo.is_file():
+                continue
+            if archivo.suffix.lower() not in IMAGEN_EXTENSIONES:
+                continue
+
+            entrada = {
+                "nombre": archivo.name,
+                "ruta": str(archivo),
+                "metadata": {},
+                "texto_extraido": ""
+            }
+
+            try:
+                with Image.open(archivo) as img:
+                    entrada["metadata"]["formato"] = img.format
+                    entrada["metadata"]["modo"] = img.mode
+                    entrada["metadata"]["dimensiones"] = f"{img.width} x {img.height} px"
+                    if hasattr(img, 'info') and img.info:
+                        entrada["metadata"]["info_extra"] = str(img.info)[:500]
+
+                    # OCR si pytesseract está disponible
+                    if TESSERACT_AVAILABLE:
+                        try:
+                            texto = pytesseract.image_to_string(img, lang='spa+eng')
+                            if texto and texto.strip():
+                                entrada["texto_extraido"] = texto.strip()
+                        except Exception as e:
+                            entrada["texto_extraido"] = f"(OCR no disponible: {e})"
+            except Exception as e:
+                entrada["error"] = str(e)
+
+            self.datos_imagenes.append(entrada)
+
+        return self.datos_imagenes
+
+    def examinar_archivos_txt(self) -> list:
+        """
+        Lee todos los archivos .txt de la carpeta y guarda nombre y contenido.
+        """
+        self.datos_textos = []
+        for archivo in sorted(self.ruta_origen.iterdir()):
+            if not archivo.is_file():
+                continue
+            if archivo.suffix.lower() != TXT_EXTENSION:
+                continue
+
+            entrada = {"nombre": archivo.name, "ruta": str(archivo), "contenido": ""}
+            try:
+                with open(archivo, "r", encoding="utf-8", errors="replace") as f:
+                    entrada["contenido"] = f.read()
+            except Exception as e:
+                entrada["error"] = str(e)
+
+            self.datos_textos.append(entrada)
+
+        return self.datos_textos
+
+    def _obtener_mensajes_whatsapp(self) -> list[dict]:
+        """Junta el contenido de todos los .txt y lo parsea como chat de WhatsApp."""
+        todos_los_textos = []
+        for entrada in self.datos_textos:
+            if entrada.get("contenido"):
+                todos_los_textos.append(entrada["contenido"])
+        texto_completo = "\n".join(todos_los_textos)
+        return _parsear_chat_whatsapp(texto_completo)
+
+    def generar_documento_word(self, nombre_archivo: str = None) -> Path:
+        """
+        Genera un documento Word con un resumen en tono "chismoso": de qué hablaban
+        en la conversación (WhatsApp) y cómo se relacionan las imágenes compartidas.
+        No copia el contenido tal cual.
+        """
+        if not DOCX_AVAILABLE:
+            raise ImportError("Se requiere 'python-docx'. Instala con: pip install python-docx")
+
+        mensajes = self._obtener_mensajes_whatsapp()
+        resumen_chismoso = _construir_resumen_chismoso(mensajes, self.datos_imagenes)
+
+        doc = Document()
+        doc.add_heading("El chismoso: resumen de la conversación", 0)
+        doc.add_paragraph(
+            f"Carpeta analizada: {self.ruta_origen}"
+        ).alignment = WD_ALIGN_PARAGRAPH.LEFT
+        doc.add_paragraph(f"Fecha del análisis: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        doc.add_heading("¿De qué iba la cosa?", level=1)
+        for parrafo in resumen_chismoso.split(". "):
+            parrafo = parrafo.strip()
+            if parrafo and not parrafo.endswith("."):
+                parrafo += "."
+            if parrafo:
+                doc.add_paragraph(parrafo)
+
+        # Pequeña sección técnica al final (opcional)
+        doc.add_heading("Datos del análisis", level=1)
+        participantes = len(set(m["autor"] for m in mensajes if m.get("autor")))
+        doc.add_paragraph(
+            f"Participantes detectados: {participantes} — "
+            f"Mensajes en el chat: {len(mensajes)} — Imágenes en la carpeta: {len(self.datos_imagenes)}."
+        )
+
+        # Determinar ruta final del .docx
+        if self.ruta_destino.suffix.lower() == '.docx':
+            ruta_final = self.ruta_destino
+        else:
+            nombre = nombre_archivo or f"Resumen_Analisis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            if not nombre.endswith(".docx"):
+                nombre += ".docx"
+            ruta_final = self.ruta_destino / nombre
+
+        self._asegurar_carpeta_destino()
+        doc.save(ruta_final)
+        return ruta_final
+
+    def ejecutar(
+        self,
+        nombre_doc: str = None,
+        examinar_imgs: bool = True,
+        examinar_txt: bool = True,
+    ) -> dict:
+        """
+        Ejecuta el flujo completo: validar, examinar imágenes, examinar .txt y generar Word.
+
+        Returns:
+            dict con 'ruta_word', 'imagenes_encontradas', 'txt_encontrados', 'ruta_origen', 'ruta_destino'.
+        """
+        self._validar_ruta_origen()
+
+        if examinar_imgs:
+            self.examinar_imagenes()
+        if examinar_txt:
+            self.examinar_archivos_txt()
+
+        ruta_word = self.generar_documento_word(nombre_archivo=nombre_doc)
+
+        return {
+            "ruta_word": str(ruta_word),
+            "imagenes_encontradas": len(self.datos_imagenes),
+            "txt_encontrados": len(self.datos_textos),
+            "ruta_origen": str(self.ruta_origen),
+            "ruta_destino": str(self.ruta_destino),
+        }
+
+
+def main():
+    """Ejemplo de uso: configura rutas y ejecuta el agente."""
+    # --- CONFIGURA ESTAS RUTAS SEGÚN TU ENTORNO ---
+    CARPETA_A_ANALIZAR = r"C:/Users/HP/Documents/PruebaBotAI"
+    CARPETA_DESTINO_DOC = r"C:/Users/HP/Documents/PERSONAL RS"
+
+    agente = AgenteAnalizador(
+        ruta_origen=CARPETA_A_ANALIZAR,
+        ruta_destino_word=CARPETA_DESTINO_DOC,
+    )
+
+    resultado = agente.ejecutar(nombre_doc="Resumen_BotAI.docx")
+    print("Análisis completado.")
+    print(f"  Carpeta analizada: {resultado['ruta_origen']}")
+    print(f"  Imágenes procesadas: {resultado['imagenes_encontradas']}")
+    print(f"  Archivos .txt leídos: {resultado['txt_encontrados']}")
+    print(f"  Documento Word generado: {resultado['ruta_word']}")
+
+
+if __name__ == "__main__":
+    main()
