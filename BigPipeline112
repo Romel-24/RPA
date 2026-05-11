@@ -1,0 +1,1047 @@
+import os
+import time
+import shutil
+import zipfile
+import random
+import json  # Nuevo import
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+# Librerías para el robot de carga
+import pandas as pd
+import glob
+import re
+from sqlalchemy import create_engine, text, inspect, types
+
+# ================= CONFIGURACIÓN ROBOT DE DESCARGA =================
+USERNAME = "correo@webmail.com"
+PASSWORD = "123"
+
+LOGIN_URL = "LinkDePagina"
+TARGET_PAGE = "ModuloDePagina"
+LOG_DIR = r"RutaCarpetaLog"
+SCREENSHOTS_DIR = r"RutaCarpetaLog"
+
+TARGET_DIR = r"RutaCarpeta"
+DOWNLOAD_DIR = r"RutaCarpeta"
+REPORTE= r"RutaCarpeta"
+
+# XPATH basados en el HTML proporcionado (funcionan igual en Chrome)
+XPATH_LOGIN_EMAIL = "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[1]/input"
+XPATH_LOGIN_PASSWORD = "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[2]/input"
+
+# Sucursal
+XPATH_BRANCH_TRIGGER = "//app-current-office-selector//p-dropdown//div[@role='button']"
+XPATH_BRANCH_ITEM_TEMPLATE = "//app-current-office-selector//p-dropdownitem[{index}]//li//span[1]"
+
+# Filtros
+XPATH_COMPRA_TRIGGER = "//p-dropdown[@placeholder='Compra']//div[@role='button']"
+XPATH_COMPRA_ITEM_TEMPLATE = "//p-dropdown[@placeholder='Compra']//p-dropdownitem[{index}]//li//span[1]"
+
+XPATH_VENTA_TRIGGER = "//p-dropdown[@placeholder='Venta']//div[@role='button']"
+XPATH_VENTA_ITEM_TEMPLATE = "//p-dropdown[@placeholder='Venta']//p-dropdownitem[{index}]//li//span[1]"
+
+# Botón Buscar
+XPATH_BUSCAR = "//button[contains(@class, 'p-button-info') and span[text()='Buscar']]"
+
+# Botón Exportar (menú desplegable)
+XPATH_EXPORTAR_DROPDOWN = "//p-splitbutton[contains(@class, 'p-button-info')]//button[contains(@class, 'p-splitbutton-menubutton')]"
+
+# Opción Excel en el menú
+XPATH_EXCEL_OPTION = "//p-tieredmenu//a[contains(., 'Excel')]"
+
+# Tiempos
+WAIT_AFTER_SEARCH = 90      # 90 segundos
+WAIT_FOR_DOWNLOAD = 90     # 120 segundos
+MAX_RETRIES = 8
+MIN_FILE_SIZE = 1024 * 10   # 10KB mínimo
+
+# ================= CONFIGURACIÓN ROBOT DE CARGA =================
+TABLA   = "detalle_visor"                    # Nombre de la tabla en PostgreSQL
+
+DB_USER = "usuario"
+DB_PASS = "clave"
+DB_HOST = "direccionip"
+DB_PORT = "puerto"
+DB_NAME = "nombrebasededatos"
+
+# ================= NUEVAS FUNCIONALIDADES =================
+
+def cargar_log_descargas(ruta_log):
+    """Lee el archivo .txt y retorna un set con los nombres de los archivos ya descargados."""
+    if not os.path.exists(ruta_log):
+        return set()
+    with open(ruta_log, 'r', encoding='utf-8') as f:
+        return set(line.strip() for line in f if line.strip())
+
+def registrar_en_log(ruta_log, nombre_archivo):
+    """Añade una nueva línea al archivo .txt con el nombre del archivo descargado."""
+    with open(ruta_log, 'a', encoding='utf-8') as f:
+        f.write(nombre_archivo + '\n')
+
+def registrar_timestamp_descarga(nombre_archivo):
+    """
+    Guarda en un archivo JSON la marca de tiempo de descarga para un archivo.
+    """
+    timestamp = datetime.now()
+    timestamp_str = timestamp.isoformat()
+    timestamp_file = os.path.join(LOG_DIR, "download_timestamps.json")
+    # Cargar diccionario existente
+    try:
+        with open(timestamp_file, 'r', encoding='utf-8') as f:
+            timestamps = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        timestamps = {}
+    # Actualizar con el nuevo archivo
+    timestamps[nombre_archivo] = timestamp_str
+    # Guardar de vuelta
+    with open(timestamp_file, 'w', encoding='utf-8') as f:
+        json.dump(timestamps, f, indent=2)
+
+def cargar_timestamps():
+    """
+    Lee el archivo de timestamps y devuelve un diccionario {nombre_archivo: timestamp_iso}
+    """
+    timestamp_file = os.path.join(LOG_DIR, "download_timestamps.json")
+    try:
+        with open(timestamp_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def clean_target_dir(directory):
+    """Elimina todos los archivos y carpetas dentro de TARGET_DIR."""
+    if not os.path.exists(directory):
+        return
+    print("  [LIMPIEZA] Eliminando archivos viejos en:", directory)
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f"    Error al eliminar {file_path}: {e}")
+    print("  [LIMPIEZA] Limpieza completada.")
+
+def generar_reporte_estadistico(df, tabla, engine):
+    """
+    Genera un archivo Excel con análisis estadístico del proceso de carga.
+    Retorna la ruta del archivo generado.
+    """
+    print("\n[REPORTE] Generando análisis estadístico...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    reporte_path = os.path.join(REPORTE, f"reporte_carga_Visor_{timestamp}.xlsx")
+    
+    with pd.ExcelWriter(reporte_path, engine='openpyxl') as writer:
+        # Hoja 1: Resumen general
+        resumen = pd.DataFrame({
+            "Fecha": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            "Total filas cargadas": [len(df)],
+            "Total columnas": [len(df.columns)],
+            "Nombre tabla destino": [tabla]
+        })
+        resumen.to_excel(writer, sheet_name="Resumen", index=False)
+        
+        # Hoja 2: Distribución por sucursal
+        if 'Sucursal' in df.columns:
+            distrib_suc = df['Sucursal'].value_counts().reset_index()
+            distrib_suc.columns = ['Sucursal', 'Cantidad']
+            distrib_suc.to_excel(writer, sheet_name="Por Sucursal", index=False)
+        
+        # Hoja 3: Distribución por estatus
+        if 'Estatus_compra' in df.columns and 'Estatus_venta' in df.columns:
+            distrib_est = df.groupby(['Estatus_compra', 'Estatus_venta']).size().reset_index(name='Cantidad')
+            distrib_est.to_excel(writer, sheet_name="Por Estatus", index=False)
+        
+        # Hoja 4: Estadísticas numéricas
+        cols_numericas = df.select_dtypes(include=['number']).columns
+        if len(cols_numericas) > 0:
+            stats = df[cols_numericas].describe().transpose()
+            stats.to_excel(writer, sheet_name="Estadísticas Numéricas")
+        
+        # Hoja 5: Nulos por columna
+        nulos = df.isnull().sum().reset_index()
+        nulos.columns = ['Columna', 'Valores Nulos']
+        nulos['Porcentaje'] = (nulos['Valores Nulos'] / len(df)) * 100
+        nulos.to_excel(writer, sheet_name="Nulos por Columna", index=False)
+        
+        # Hoja 6: Muestra de datos (primeras 100 filas)
+        df.head(100).to_excel(writer, sheet_name="Muestra Datos", index=False)
+    
+    print(f"  [REPORTE] Archivo guardado en: {reporte_path}")
+    return reporte_path
+
+def enviar_correo_outlook(ruta_adjunto):
+    """
+    Envía un correo usando Outlook Web con el archivo adjunto.
+    """
+    print("\n[EMAIL] Iniciando envío de correo...")
+    # Configuración del driver para Outlook
+    chrome_options = Options()
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--safebrowsing-disable-download-protection")
+    chrome_options.add_argument("--disable-features=SafeBrowsing")
+    chrome_options.add_argument("--disable-web-security")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--allow-running-insecure-content")
+    chrome_options.add_argument("--ignore-certificate-errors")
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    chrome_options.add_argument(f"user-agent={user_agent}")
+    
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.maximize_window()
+    except Exception as e:
+        print(f"  Error al iniciar Chrome: {e}")
+        return
+    
+    try:
+        # 1. Navegar a Outlook
+        OUTLOOK_URL = "https://mail.riomarket.com/owa/auth/logon.aspx?replaceCurrent=1&url=https%3a%2f%2fmail.riomarket.com%2fowa%2f"
+        print("  [EMAIL] Cargando Outlook...")
+        driver.get(OUTLOOK_URL)
+        time.sleep(3)
+        
+        # 2. Login
+        wait = WebDriverWait(driver, 20)
+        usuario_field = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+        usuario_field.clear()
+        usuario_field.send_keys("rio\\ROMEL.SANCHEZ")  # Usuario con dominio
+        password_field = driver.find_element(By.NAME, "password")
+        password_field.clear()
+        password_field.send_keys("RRR24089900")
+        password_field.send_keys(Keys.RETURN)
+        print("  [EMAIL] Credenciales enviadas.")
+        
+        # 3. Esperar a que cargue la bandeja y manejar alerta de aceptación
+        time.sleep(5)
+        try:
+            aceptar_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "/html/body/div[12]/div/div[2]/div[4]/div/div/span/button/span"))
+            )
+            aceptar_btn.click()
+            print("  [EMAIL] Alerta aceptada.")
+            time.sleep(2)
+        except:
+            print("  [EMAIL] No se detectó alerta o ya fue cerrada.")
+        
+        # 4. Hacer clic en "Nuevo mensaje"
+        nuevo_btn = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(@data-action, 'NewMail') or contains(text(), 'Nuevo mensaje')]"))
+        )
+        nuevo_btn.click()
+        print("  [EMAIL] Botón 'Nuevo mensaje' clickeado.")
+        time.sleep(3)
+        
+        # 5. Llenar campo "Para"
+        para_field = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.XPATH, "//div[@aria-label='Para']"))
+        )
+        para_field.click()
+        para_field.send_keys("veronica.sepulveda@riomarket.com; david.mendoza@riomarket.com")
+        print("  [EMAIL] Destinatarios en 'Para' ingresados.")
+        
+        # 6. Llenar campo "CC" (clic en el enlace CC si está colapsado)
+        try:
+            cc_link = driver.find_element(By.XPATH, "//span[contains(text(), 'CC')]")
+            cc_link.click()
+            time.sleep(1)
+        except:
+            pass
+        cc_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//div[@aria-label='Cc']"))
+        )
+        cc_field.click()
+        cc_field.send_keys("edgar.garcia@riomarket.com; ricardo.palma@riomarket.com; mariana.gonzalez@riomarket.com; luis.cornieles@riomarket.com")
+        print("  [EMAIL] Destinatarios en 'CC' ingresados.")
+        
+        # 7. Llenar asunto
+        asunto_field = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Agregar un asunto']"))
+        )
+        asunto_field.click()
+        asunto_field.send_keys("Proceso Detalle de visor de productos")
+        print("  [EMAIL] Asunto ingresado.")
+        
+        # 8. Adjuntar archivo
+        adjuntar_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[@title='Adjuntar archivo']"))
+        )
+        adjuntar_btn.click()
+        time.sleep(1)
+        file_input = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+        )
+        file_input.send_keys(os.path.abspath(ruta_adjunto))
+        print(f"  [EMAIL] Archivo adjuntado: {ruta_adjunto}")
+        time.sleep(3)  # Esperar a que se suba
+        
+        # 9. Enviar correo
+        enviar_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(@data-action, 'Send') or contains(text(), 'Enviar')]"))
+        )
+        enviar_btn.click()
+        print("  [EMAIL] Correo enviado.")
+        time.sleep(5)
+        
+    except Exception as e:
+        print(f"  [EMAIL] Error durante el envío: {e}")
+        driver.save_screenshot(os.path.join(SCREENSHOTS_DIR, "error_outlook.png"))
+    finally:
+        driver.quit()
+        print("  [EMAIL] Navegador cerrado.")
+
+# ================= FUNCIONES AUXILIARES (ROBOT DE DESCARGA) =================
+def human_delay(min_seconds=0.3, max_seconds=1.2):
+    delay = random.uniform(min_seconds, max_seconds)
+    time.sleep(delay)
+
+def human_type(element, text, min_delay=0.05, max_delay=0.25):
+    for char in text:
+        element.send_keys(char)
+        time.sleep(random.uniform(min_delay, max_delay))
+
+def human_mouse_movement(driver, element):
+    action = ActionChains(driver)
+    action.move_to_element(element)
+    action.perform()
+    human_delay(0.2, 0.5)
+
+def apply_undetected_patches(driver):
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+def setup_driver():
+    """Configura Chrome deshabilitando protecciones de descarga."""
+    chrome_options = Options()
+    
+    # 1. Aseguramos que la ruta de descarga sea absoluta y con formato nativo de Windows
+    download_path = os.path.abspath(DOWNLOAD_DIR)
+    
+    # 2. Preferencias de descarga y seguridad reforzadas PARA EVITAR EL BLOQUEO "Se produjo un error"
+    prefs = {
+        "download.default_directory": download_path,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,                 
+        "safebrowsing.disable_download_protection": True,  
+        "download.safe_browsing.enabled": False,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+        "profile.default_content_settings.popups": 0,
+        "profile.default_content_setting_values.insecure_private_network_requests": 1
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    
+    
+    # Argumentos para deshabilitar protecciones adicionales
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--safebrowsing-disable-download-protection")
+    chrome_options.add_argument("--safebrowsing-disable-extension-protection")
+    chrome_options.add_argument("--disable-features=SafeBrowsing")
+    chrome_options.add_argument("--disable-web-security")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--allow-running-insecure-content")
+    chrome_options.add_argument("--ignore-certificate-errors")
+    
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    chrome_options.add_argument(f"user-agent={user_agent}")
+    
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        apply_undetected_patches(driver)
+        driver.maximize_window()
+        print("  ✅ Driver de Chrome inicializado correctamente")
+        return driver
+    except Exception as e:
+        print(f"  ⚠️ Error con ChromeDriver Manager: {e}")
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+            apply_undetected_patches(driver)
+            driver.maximize_window()
+            return driver
+        except Exception as e2:
+            raise Exception(f"No se pudo inicializar el driver de Chrome: {e2}")
+
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def is_valid_excel(file_path):
+    """Verifica si un archivo Excel es válido."""
+    try:
+        if not os.path.exists(file_path):
+            return False
+        size = os.path.getsize(file_path)
+        if size < MIN_FILE_SIZE:
+            print(f"    Archivo demasiado pequeño: {size} bytes")
+            return False
+        with zipfile.ZipFile(file_path, 'r') as zip_file:
+            required_files = ['[Content_Types].xml', 'xl/workbook.xml']
+            for req in required_files:
+                if req not in zip_file.namelist():
+                    print(f"    Archivo Excel corrupto: falta {req}")
+                    return False
+        return True
+    except zipfile.BadZipFile:
+        print(f"    Archivo no es un ZIP válido")
+        return False
+    except Exception as e:
+        print(f"    Error al validar archivo: {e}")
+        return False
+
+def clean_download_folder():
+    """Mueve todos los archivos .xlsx existentes a una subcarpeta de backup."""
+    backup_dir = os.path.join(DOWNLOAD_DIR, "backup_" + datetime.now().strftime("%Y%m%d"))
+    os.makedirs(backup_dir, exist_ok=True)
+    moved = 0
+    for f in os.listdir(DOWNLOAD_DIR):
+        if f.endswith('.xlsx') and not f.startswith('backup'):
+            shutil.move(os.path.join(DOWNLOAD_DIR, f), os.path.join(backup_dir, f))
+            moved += 1
+    if moved > 0:
+        print(f"  Archivos previos movidos a backup: {moved}")
+
+def wait_for_download_complete(timeout=WAIT_FOR_DOWNLOAD):
+    start_time = time.time()
+    # Obtener archivos .xlsx que ya existían antes de la descarga
+    initial_xlsx = set(f for f in os.listdir(DOWNLOAD_DIR) if f.endswith('.xlsx'))
+
+    while time.time() - start_time < timeout:
+        files = os.listdir(DOWNLOAD_DIR)
+        crdownload = [f for f in files if f.endswith('.crdownload')]
+        if crdownload:
+            # Aún descargando
+            time.sleep(1)
+            continue
+
+        # Ya no hay .crdownload -> buscar .xlsx que no estuviera al inicio
+        current_xlsx = set(f for f in files if f.endswith('.xlsx'))
+        new_xlsx = current_xlsx - initial_xlsx
+        if new_xlsx:
+            latest = max(new_xlsx, key=lambda f: os.path.getctime(os.path.join(DOWNLOAD_DIR, f)))
+            print(f"    Archivo detectado: {latest}")
+            return latest
+
+        time.sleep(1)
+    return None
+
+def safe_click(driver, element, timeout=10):
+    wait_for_overlay_to_disappear(driver)
+    try:
+        human_mouse_movement(driver, element)
+        WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(element))
+        element.click()
+        human_delay(0.1, 0.4)
+        return True
+    except:
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            human_delay(0.1, 0.4)
+            return True
+        except:
+            return False
+
+def wait_for_overlay_to_disappear(driver, timeout=30):
+    overlay_xpaths = [
+        "//div[contains(@class, 'p-component-overlay')]",
+        "//div[contains(@class, 'p-dialog-mask')]",
+    ]
+    for xpath in overlay_xpaths:
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.invisibility_of_element_located((By.XPATH, xpath))
+            )
+        except:
+            pass
+
+def login(driver):
+    print("  [LOGIN] Ingresando credenciales...")
+    driver.get(LOGIN_URL)
+    human_delay(2, 4)
+    wait = WebDriverWait(driver, 20)
+    email_field = wait.until(EC.presence_of_element_located((By.XPATH, XPATH_LOGIN_EMAIL)))
+    human_mouse_movement(driver, email_field)
+    email_field.click()
+    human_type(email_field, USERNAME)
+    password_field = driver.find_element(By.XPATH, XPATH_LOGIN_PASSWORD)
+    human_mouse_movement(driver, password_field)
+    password_field.click()
+    human_type(password_field, PASSWORD)
+    password_field.send_keys(Keys.ENTER)
+    wait.until(EC.presence_of_element_located((By.XPATH, "//app-current-office-selector")))
+    human_delay(2, 3)
+    print("  [LOGIN] Sesión iniciada.")
+
+def navigate_to_target(driver):
+    print("  [NAVEGACIÓN] Accediendo a la página de productos...")
+    driver.get(TARGET_PAGE)
+    human_delay(3, 5)
+    wait = WebDriverWait(driver, 30)
+    wait.until(EC.presence_of_element_located((By.XPATH, "//app-products-branch-filter")))
+    human_delay(1, 2)
+
+def get_branch_names(driver):
+    wait = WebDriverWait(driver, 10)
+    trigger = driver.find_element(By.XPATH, XPATH_BRANCH_TRIGGER)
+    safe_click(driver, trigger)
+    human_delay(1, 2)
+    names = []
+    for idx in range(1, 30):
+        xpath = XPATH_BRANCH_ITEM_TEMPLATE.format(index=idx)
+        try:
+            element = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            name = element.text.strip()
+            if name and name not in names:
+                names.append(name)
+        except:
+            break
+    driver.find_element(By.TAG_NAME, 'body').click()
+    human_delay(0.5, 1)
+    return names
+
+def select_branch_by_index(driver, index):
+    print(f"  [SUCURSAL] Seleccionando sucursal índice {index}...")
+    wait = WebDriverWait(driver, 10)
+    trigger = driver.find_element(By.XPATH, XPATH_BRANCH_TRIGGER)
+    safe_click(driver, trigger)
+    human_delay(1, 2)
+    xpath = XPATH_BRANCH_ITEM_TEMPLATE.format(index=index)
+    item = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+    safe_click(driver, item)
+    wait_for_overlay_to_disappear(driver)
+    human_delay(2, 3)
+
+def select_dropdown_option(driver, trigger_xpath, option_xpath_template, option_index):
+    wait = WebDriverWait(driver, 10)
+    wait_for_overlay_to_disappear(driver)
+    trigger = driver.find_element(By.XPATH, trigger_xpath)
+    safe_click(driver, trigger)
+    human_delay(0.5, 1)
+    option_xpath = option_xpath_template.format(index=option_index)
+    option = wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
+    safe_click(driver, option)
+    human_delay(0.5, 1)
+
+def table_has_data(driver):
+    try:
+        driver.find_element(By.XPATH, "//*[contains(text(), 'Mostrando 0 hasta 0 de 0 registros')]")
+        return False
+    except:
+        return True
+
+def wait_for_table_to_load(driver):
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.invisibility_of_element_located((By.XPATH, "//*[contains(@class, 'p-progress-spinner')]"))
+        )
+    except:
+        pass
+    human_delay(3, 5)
+
+def perform_combination(driver, compra_idx, venta_idx, branch_name, date_str, retry_count=0):
+    try:
+        # Seleccionar filtros
+        select_dropdown_option(driver, XPATH_COMPRA_TRIGGER, XPATH_COMPRA_ITEM_TEMPLATE, compra_idx)
+        select_dropdown_option(driver, XPATH_VENTA_TRIGGER, XPATH_VENTA_ITEM_TEMPLATE, venta_idx)
+
+        # Buscar
+        buscar_btn = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, XPATH_BUSCAR)))
+        safe_click(driver, buscar_btn)
+        print(f"  ✅ Clic en Buscar")
+
+        print(f"  Esperando {WAIT_AFTER_SEARCH} segundos...")
+        time.sleep(WAIT_AFTER_SEARCH)
+
+        wait_for_overlay_to_disappear(driver)
+        wait_for_table_to_load(driver)
+
+        # Verificar datos
+        if not table_has_data(driver):
+            print("  Tabla sin datos. Omitiendo.")
+            return
+
+        # Limpiar carpeta de descargas antes de exportar
+        clean_download_folder()
+
+        # Abrir menú de exportación
+        print("  Abriendo menú de exportación...")
+        export_btn = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, XPATH_EXPORTAR_DROPDOWN)))
+        safe_click(driver, export_btn)
+        human_delay(1, 2)
+
+        # Hacer clic en la opción Excel
+        excel_opt = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, XPATH_EXCEL_OPTION)))
+        safe_click(driver, excel_opt)
+        print("  ✅ Clic en Excel realizado")
+
+        # Esperar a que la descarga termine
+        print(f"  Esperando hasta {WAIT_FOR_DOWNLOAD} segundos la descarga...")
+        new_file = wait_for_download_complete(timeout=WAIT_FOR_DOWNLOAD)
+
+        if new_file:
+            file_path = os.path.join(DOWNLOAD_DIR, new_file)
+            if is_valid_excel(file_path):
+                compra_text = "Activo" if compra_idx == 2 else "Inactivo"
+                venta_text = "Activo" if venta_idx == 2 else "Inactivo"
+                branch_safe = branch_name.replace(' ', '_')
+                new_filename = f"{branch_safe}_Visor_C_{compra_text}_V_{venta_text}{date_str}.xlsx"
+                new_path = os.path.join(TARGET_DIR, new_filename)
+                
+                shutil.move(file_path, new_path)
+            
+                # Verificación física final antes de dar el OK
+                if os.path.exists(new_path):
+                    print(f"  ✅ Archivo confirmado en destino: {new_filename}")
+                    # Registrar timestamp de descarga (NUEVO)
+                    registrar_timestamp_descarga(new_filename)
+                    return True
+                else:
+                    return False
+            else:
+                if os.path.exists(file_path): os.remove(file_path)
+                raise Exception("Archivo Excel corrupto o incompleto.")
+        else:
+            raise Exception("Timeout: No se detectó la descarga del archivo.")
+
+    except Exception as e:
+        print(f"  Error: {e}")
+        if retry_count < MAX_RETRIES:
+            print(f"  Reintento {retry_count+1}/{MAX_RETRIES}...")
+            human_delay(5, 10)
+            return perform_combination(driver, compra_idx, venta_idx, branch_name, date_str, retry_count+1)
+        else:
+            raise
+
+# ================= FLUJO PRINCIPAL ROBOT DE DESCARGA =================
+def robot_descarga():
+    ensure_dir(TARGET_DIR)
+    ensure_dir(LOG_DIR)
+    ensure_dir(SCREENSHOTS_DIR)
+    
+    # Limpiar archivo de timestamps de ejecuciones anteriores (NUEVO)
+    timestamp_file = os.path.join(LOG_DIR, "download_timestamps.json")
+    if os.path.exists(timestamp_file):
+        os.remove(timestamp_file)
+        print("  [TIMESTAMP] Archivo de timestamps reiniciado.")
+    
+    print("=" * 60)
+    print("ROBOT DE DESCARGA - CONTROL DE FLUJO POR LOG")
+    print("=" * 60)
+    
+    # Limpiamos solo la carpeta de reportes (los logs están seguros en LOG_DIR)
+    clean_target_dir(TARGET_DIR)
+
+    LOG_FILE_PATH = os.path.join(LOG_DIR, "carga_detalle_visor.txt")
+    descargas_previas = cargar_log_descargas(LOG_FILE_PATH)
+    
+    errores_descarga = [] # Para el reporte final de fallos
+
+    driver = None
+    try:
+        driver = setup_driver()
+        login(driver)
+        navigate_to_target(driver)
+
+        branch_names = get_branch_names(driver)
+        date_str = datetime.now().strftime("%d%m%Y")
+        
+        combinaciones = [
+            (2, 2, "Activo-Activo"),
+            (3, 3, "Inactivo-Inactivo"),
+            (3, 2, "Inactivo-Activo"),
+            (2, 3, "Activo-Inactivo")
+        ]
+
+        total_sucursales = len(branch_names)
+        
+        for idx, branch_name in enumerate(branch_names, 1):
+            branch_safe = branch_name.replace(' ', '_')
+            
+            # --- VERIFICACIÓN DE LOG ANTES DE ENTRAR A LA SUCURSAL ---
+            pendientes_sucursal = []
+            for c_idx, v_idx, nombre_comb in combinaciones:
+                c_txt = "Activo" if c_idx == 2 else "Inactivo"
+                v_txt = "Activo" if v_idx == 2 else "Inactivo"
+                filename_esperado = f"{branch_safe}_Visor_C_{c_txt}_V_{v_txt}{date_str}.xlsx"
+                
+                if filename_esperado not in descargas_previas:
+                    pendientes_sucursal.append((c_idx, v_idx, nombre_comb, filename_esperado))
+
+            if not pendientes_sucursal:
+                print(f"--- [{idx}/{total_sucursales}] {branch_name} ⏩ OMITIDA (Ya en log) ---")
+                continue
+
+            # Si hay pendientes, seleccionamos la sucursal
+            print(f"\n--- [{idx}/{total_sucursales}] {branch_name} ({len(pendientes_sucursal)} pendientes) ---")
+            select_branch_by_index(driver, idx)
+
+            for c_idx, v_idx, nombre_comb, filename in pendientes_sucursal:
+                print(f"  -> Procesando: {nombre_comb}")
+                try:
+                    # perform_combination ahora retorna True si el archivo se guardó físicamente
+                    exito = perform_combination(driver, c_idx, v_idx, branch_name, date_str)
+                    
+                    if exito:
+                        # SOLO ESCRIBIMOS EN EL LOG SI EL ARCHIVO EXISTE
+                        registrar_en_log(LOG_FILE_PATH, filename)
+                        descargas_previas.add(filename)
+                        print(f"  ✅ Log actualizado: {filename}")
+                    else:
+                        raise Exception("El archivo no se guardó correctamente en el destino.")
+
+                except Exception as e:
+                    error_msg = f"Error en {branch_name} ({nombre_comb}): {str(e)}"
+                    print(f"  ❌ {error_msg}")
+                    errores_descarga.append(error_msg)
+                    ss_name = f"error_{branch_safe}_{nombre_comb}_{datetime.now().strftime('%H%M%S')}.png"
+                    driver.save_screenshot(os.path.join(SCREENSHOTS_DIR, ss_name))
+
+        # --- RESUMEN FINAL ---
+        print("\n" + "=" * 60)
+        print("RESUMEN DE EJECUCIÓN")
+        print("=" * 60)
+        if errores_descarga:
+            print(f"Se encontraron {len(errores_descarga)} errores:")
+            for err in errores_descarga:
+                print(f"  - {err}")
+        else:
+            print("Proceso completado sin errores críticos.")
+        print("=" * 60)
+
+    finally:
+        if driver:
+            driver.quit()
+
+# ================= FUNCIONES ROBOT DE CARGA =================
+def extraer_sucursal(nombre_archivo: str) -> str:
+    """
+    Extrae la sucursal del nombre del archivo.
+    Se asume que el nombre tiene la forma: <sucursal>_Visor_...
+    Retorna la parte anterior a "_Visor".
+    """
+    patron = r'^(.*?)_Visor'
+    match = re.search(patron, nombre_archivo)
+    if match:
+        return match.group(1)
+    else:
+        print(f"  [WARN] No se pudo extraer sucursal del archivo {nombre_archivo}")
+        return "Desconocida"
+
+def extraer_estatus(nombre_archivo: str):
+    """
+    Extrae los estados de compra y venta del nombre del archivo.
+    Formato esperado: ..._C_Activo_V_ActivoDDMMYYYY o ..._C_Activo_V_Activo_DDMMYYYY
+    Retorna (estatus_compra, estatus_venta) como strings "Activo"/"Inactivo".
+    """
+    patron = r'C_(\w+)_V_(\w+)(?:_\d+|\d+)?'
+    match = re.search(patron, nombre_archivo)
+    if match:
+        compra = match.group(1)
+        venta = match.group(2)
+        # Eliminar dígitos que puedan haber quedado pegados al estado (por si la fecha no tiene separador)
+        venta = re.sub(r'\d+$', '', venta)
+        return compra, venta
+    else:
+        print(f"  [WARN] No se pudo extraer estado del archivo {nombre_archivo}")
+        return "Desconocido", "Desconocido"
+
+def limpiar_y_convertir(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Limpia y convierte los tipos de datos según lo requerido:
+    - Remueve "Bs. ", "$ ", comas, puntos de miles y convierte correctamente los decimales.
+    - Convierte a numérico (float) las columnas monetarias.
+    - Convierte a entero las columnas de unidades y disponibles.
+    """
+    print("  [DEBUG] Limpiando y convirtiendo tipos de datos...")
+
+    # Columnas que deben ser enteras
+    cols_int = ["Unidades", "Disponible", "Total unidades"]
+
+    # Columnas que deben ser decimales (se eliminan símbolos monetarios)
+    cols_decimal = [
+        "Costo base", "Costo conversión", "Factor neto",
+        "Costo neto base", "Costo neto conversión", "Factor neto venta",
+        "Costo neto venta base", "Costo neto venta conversión", "Factor venta",
+        "PVP base", "PVP conversión"
+    ]
+
+    # Diccionario de limpieza: columna -> símbolo a quitar y formato esperado
+    # Formato: (simbolo, usar_formato_espanol)
+    # Para Bs. se usa formato español (punto miles, coma decimal)
+    # Para $ se usa formato inglés (coma miles, punto decimal)
+    formatos = {
+        "Costo base": ("Bs.", False),
+        "Costo neto base": ("Bs.", False),
+        "Costo neto venta base": ("Bs.", False),
+        "PVP base": ("Bs.", False),
+        "Costo conversión": ("$", False),
+        "Costo neto conversión": ("$", False),
+        "Costo neto venta conversión": ("$", False),
+        "PVP conversión": ("$", False),
+        # Los factores no llevan símbolo, pero pueden tener separadores
+        "Factor neto": (None, True),
+        "Factor neto venta": (None, True),
+        "Factor venta": (None, True),
+    }
+
+    for col in cols_decimal:
+        if col not in df.columns:
+            print(f"    [WARN] Columna '{col}' no encontrada, se omite.")
+            continue
+
+        # Convertir a string
+        df[col] = df[col].astype(str)
+
+        # Obtener formato
+        simbolo, es_espanol = formatos.get(col, (None, False))
+
+        # Eliminar símbolo monetario si existe
+        if simbolo:
+            df[col] = df[col].str.replace(simbolo, "", regex=False)
+
+        # Limpiar espacios sobrantes
+        df[col] = df[col].str.strip()
+
+        # Manejar separadores según el formato
+        if es_espanol:
+            # Formato español: punto como separador de miles, coma como decimal
+            # Ejemplo: "1.234,56" -> "1234,56" -> luego reemplazar coma por punto
+            df[col] = df[col].str.replace(".", "", regex=False)   # quitar puntos de miles
+            df[col] = df[col].str.replace(",", ".", regex=False)  # coma decimal -> punto
+        else:
+            # Formato inglés: coma como separador de miles, punto como decimal
+            # Ejemplo: "1,234.56" -> "1234.56"
+            df[col] = df[col].str.replace(",", "", regex=False)   # quitar comas de miles
+            # El punto decimal se mantiene
+
+        # Convertir a numérico (float64)
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Limpiar y convertir columnas enteras
+    for col in cols_int:
+        if col not in df.columns:
+            print(f"    [WARN] Columna '{col}' no encontrada, se omite.")
+            continue
+
+        # Convertir a numérico (puede tener decimales .0)
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Redondear para eliminar decimales (ej. 10.0 -> 10)
+        df[col] = df[col].round(0)
+        # Convertir a Int64 nullable (permite NaN)
+        df[col] = df[col].astype('Int64')
+
+    print("  [DEBUG] Conversión finalizada.")
+    return df
+
+def dividir_categoria(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Divide la columna 'Categoría' por '>>' en tres columnas:
+    Categoría, Subcategoria1, Subcategoria2.
+    """
+    print("     [DETAIL] Ejecutando dividir_categoria...")
+    split_df = df['Categoría'].str.split('>>', n=2, expand=True)
+
+    # Asegurar que siempre haya 3 columnas
+    for i in range(3):
+        if i not in split_df.columns:
+            split_df[i] = None
+
+    split_df.columns = ['Categoría', 'Subcategoria1', 'Subcategoria2']
+    split_df = split_df.fillna('')
+
+    df = df.drop(columns=['Categoría'])
+    return pd.concat([df, split_df], axis=1)
+
+def procesar_archivo(ruta_archivo: str, timestamps: dict) -> pd.DataFrame:
+    """
+    Lee un archivo (Excel o CSV), limpia datos y añade columnas de estado y sucursal.
+    Además agrega la columna 'Fecha_hora_descarga' a partir del diccionario de timestamps.
+    """
+    nombre_base = os.path.basename(ruta_archivo)
+    print(f"  [DEBUG] Procesando archivo: {nombre_base}")
+
+    if ruta_archivo.endswith('.xlsx'):
+        df = pd.read_excel(ruta_archivo)
+    elif ruta_archivo.endswith('.csv'):
+        df = pd.read_csv(ruta_archivo)
+    else:
+        print(f"  [WARN] Extensión no soportada: {ruta_archivo}")
+        return pd.DataFrame()
+
+    print(f"    [DEBUG] {len(df)} filas leídas. Dividiendo categoría...")
+    df = dividir_categoria(df)
+
+    df = limpiar_y_convertir(df)
+
+    # Añadir columna de sucursal reemplazando guiones bajos por espacios
+    sucursal = extraer_sucursal(nombre_base).replace('_', ' ')
+    df['Sucursal'] = sucursal
+    print(f"    [DEBUG] Sucursal = '{sucursal}'")
+
+    # Añadir columnas de estado
+    compra, venta = extraer_estatus(nombre_base)
+    df['Estatus_compra'] = compra
+    df['Estatus_venta'] = venta
+    print(f"    [DEBUG] Estado compra = '{compra}', estado venta = '{venta}'.")
+
+    # ========== NUEVO: Agregar columna de fecha/hora de descarga ==========
+    timestamp_str = timestamps.get(nombre_base)
+    if timestamp_str:
+        df['Fecha_hora_descarga'] = pd.to_datetime(timestamp_str)
+        print(f"    [DEBUG] Fecha/hora descarga = {timestamp_str}")
+    else:
+        df['Fecha_hora_descarga'] = pd.NaT
+        print(f"    [WARN] No se encontró timestamp para {nombre_base}. Se asigna NaT.")
+
+    print(f"    [DEBUG] DataFrame final shape: {df.shape}")
+    return df
+
+def procesar_carpeta(ruta_carpeta: str, timestamps: dict) -> pd.DataFrame:
+    """
+    Procesa todos los archivos .xlsx y .csv dentro de la carpeta.
+    Retorna un único DataFrame con la unión de todos.
+    """
+    print(f"[PROCESO] Buscando archivos en: {ruta_carpeta}")
+    archivos = glob.glob(os.path.join(ruta_carpeta, "*.xlsx")) + \
+               glob.glob(os.path.join(ruta_carpeta, "*.csv"))
+    print(f"[PROCESO] Encontrados {len(archivos)} archivos.")
+
+    df_list = []
+    for archivo in archivos:
+        df = procesar_archivo(archivo, timestamps)
+        if not df.empty:
+            df_list.append(df)
+
+    if not df_list:
+        print("[ERROR] No se pudo cargar ningún archivo.")
+        return pd.DataFrame()
+
+    df_final = pd.concat(df_list, ignore_index=True)
+    print(f"[PROCESO] Total de filas después de unir: {len(df_final)}")
+    return df_final
+
+def cargar_a_postgres(df: pd.DataFrame, tabla: str, engine):
+    """
+    Carga el DataFrame a PostgreSQL, truncando la tabla si existe.
+    Se especifican los tipos de datos SQL deseados para ciertas columnas.
+    """
+    print(f"\n[CARGA] Conectando a base de datos (tabla: {tabla})...")
+
+    dtype_mapping = {}
+
+    # Columnas decimales
+    cols_decimal = [
+        "Costo base", "Costo conversión", "Factor neto",
+        "Costo neto base", "Costo neto conversión", "Factor neto venta",
+        "Costo neto venta base", "Costo neto venta conversión", "Factor venta",
+        "PVP base", "PVP conversión"
+    ]
+    for col in cols_decimal:
+        if col in df.columns:
+            dtype_mapping[col] = types.Numeric(precision=15, scale=2)
+
+    # Columnas enteras
+    cols_int = ["Unidades", "Disponible", "Total unidades"]
+    for col in cols_int:
+        if col in df.columns:
+            dtype_mapping[col] = types.Integer
+
+    # ========== NUEVO: Tipo para la columna de fecha/hora ==========
+    if 'Fecha_hora_descarga' in df.columns:
+        dtype_mapping['Fecha_hora_descarga'] = types.DateTime
+
+    with engine.connect() as conn:
+        inspector = inspect(engine)
+        if tabla in inspector.get_table_names():
+            print(f"  [CARGA] La tabla '{tabla}' ya existe. Truncando...")
+            conn.execute(text(f"TRUNCATE TABLE {tabla} RESTART IDENTITY;"))
+            conn.commit()
+            print("  [CARGA] Truncado exitoso.")
+        else:
+            print(f"  [CARGA] La tabla '{tabla}' no existe. Se creará durante la inserción.")
+
+        print(f"  [CARGA] Insertando {len(df)} filas...")
+        df.to_sql(tabla, engine, if_exists='append', index=False, dtype=dtype_mapping, method='multi', chunksize=1000)
+        print("  [CARGA] Inserción completada.")
+        conn.commit()
+
+# ================= FLUJO PRINCIPAL ROBOT DE CARGA =================
+def robot_carga():
+    print("\n" + "=" * 60)
+    print("ROBOT DE CARGA - INICIO")
+    print("=" * 60)
+
+    # Cargar timestamps de descarga (NUEVO)
+    timestamps = cargar_timestamps()
+    print(f"[INFO] Se cargaron {len(timestamps)} timestamps de descarga.")
+
+    print("\n[PASO 1] Procesar archivos en la carpeta...")
+    df_final = procesar_carpeta(TARGET_DIR, timestamps)   # pasa el diccionario de timestamps
+
+    if df_final.empty:
+        print("[ERROR] No hay datos para cargar. Finalizando.")
+        return
+
+    # Reordenar columnas para que 'Sucursal' sea la primera
+    if 'Sucursal' in df_final.columns:
+        cols = ['Sucursal'] + [c for c in df_final.columns if c != 'Sucursal']
+        df_final = df_final[cols]
+
+    print(f"\n[PASO 2] Resumen de datos procesados:")
+    print(f"  - Filas: {len(df_final)}")
+    print(f"  - Columnas: {list(df_final.columns)}")
+
+    print("\n[PASO 3] Conectando a PostgreSQL...")
+    try:
+        engine = create_engine(
+            f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        )
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("  Conexión exitosa.")
+    except Exception as e:
+        print(f"  ERROR de conexión: {e}")
+        return
+
+    print("\n[PASO 4] Cargando datos a la tabla...")
+    cargar_a_postgres(df_final, TABLA, engine)
+
+    # ========== NUEVAS FUNCIONALIDADES DESPUÉS DE LA CARGA ==========
+    print("\n[PASO 5] Generando reporte estadístico...")
+    ruta_reporte = generar_reporte_estadistico(df_final, TABLA, engine)
+    print("\n[PASO 6] Enviando correo con el reporte...")
+    enviar_correo_outlook(ruta_reporte)
+
+    print("\n" + "=" * 60)
+    print("CARGA FINALIZADA CON ÉXITO")
+    print("=" * 60)
+
+# ================= EJECUCIÓN COMBINADA =================
+if __name__ == "__main__":
+    try:
+        # 1. Ejecutar robot de descarga
+        robot_descarga()
+    except Exception as e:
+        print(f"\n[ERROR] Falló la descarga: {e}")
+        print("Se continuará con la carga de los archivos existentes.")
+    finally:
+        # 2. Ejecutar robot de carga siempre, independientemente de si la descarga tuvo errores
+        robot_carga()
