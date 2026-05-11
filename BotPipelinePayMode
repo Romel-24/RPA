@@ -1,0 +1,503 @@
+"""
+Automatización: Consolidado ventas por forma de pago
+Descarga el reporte diario del ERP riomarket.com y lo guarda en la carpeta local.
+
+Requiere:
+    pip install selenium webdriver-manager
+"""
+
+import os
+import time
+import shutil
+import glob
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.action_chains import ActionChains
+
+
+# ---------------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------------
+EMAIL = "correo@webmail.com"
+PASSWORD = "123"
+URL_LOGIN = "LinkPagina"
+URL_REPORTE = "ModuloDePagina"
+
+CARPETA_DESTINO = r"RutaCarpeta"
+
+# Carpeta de descargas predeterminada de Windows
+CARPETA_DESCARGAS = os.path.join(os.path.expanduser("~"), "Downloads")
+
+# ---------------------------------------------------------------------------
+# Fechas
+# ---------------------------------------------------------------------------
+hoy = datetime.now()
+ayer = hoy - timedelta(days=1)
+
+# Formato para escribir en los campos de fecha: DDMMYYYY (sin barras)
+fecha_campo = ayer.strftime("%d%m%Y")      # ej. "09042026"
+
+# Formato para el nombre del archivo: DDMMYYYY del día del reporte (ayer)
+fecha_nombre = ayer.strftime("%d%m%Y")     # CORREGIDO: usa ayer en lugar de hoy
+
+NOMBRE_ARCHIVO = f"Formas_Pago_{fecha_nombre}"
+
+# ---------------------------------------------------------------------------
+# XPATHs
+# ---------------------------------------------------------------------------
+XPATH_EMAIL = (
+    "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[1]/input"
+)
+XPATH_PASSWORD = (
+    "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[2]/input"
+)
+XPATH_DESDE = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div/app-sale-payment-method-filters/div/div/div[1]/"
+    "app-date-filter/kendo-daterange/div/div[1]/kendo-floatinglabel/kendo-dateinput/input"
+)
+XPATH_HASTA = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div/app-sale-payment-method-filters/div/div/div[1]/"
+    "app-date-filter/kendo-daterange/div/div[2]/kendo-floatinglabel/kendo-dateinput"
+)
+# XPATH del input de búsqueda del multiselect
+XPATH_SUCURSALES_INPUT = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div/app-sale-payment-method-filters/div/div/div[2]/"
+    "app-multi-select-filter/kendo-floatinglabel/kendo-multiselect/kendo-taglist/"
+    "kendo-searchbar/input"
+)
+XPATH_BUSCAR = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div/app-sale-payment-method-filters/div/div/div[5]/"
+    "app-filter-buttons/div/button[1]"
+)
+XPATH_TOTAL_VENTA = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div[2]/div[2]/label[1]"
+)
+XPATH_EXPORTAR = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/button"
+)
+XPATH_VERIFICACION_REPORTE = (
+    "/html/body/app-root/app-layout/div/div/div[1]/app-report-main/div/"
+    "app-sale-payment-method/div/h5"
+)
+
+
+# ---------------------------------------------------------------------------
+# Funciones auxiliares
+# ---------------------------------------------------------------------------
+
+def doble_clic_y_escribir(driver, wait, xpath, texto, usar_actions=False):
+    """Hace doble clic en el campo y escribe el texto indicado."""
+    elemento = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+    if usar_actions:
+        actions = ActionChains(driver)
+        actions.double_click(elemento).perform()
+    else:
+        elemento.double_click() if hasattr(elemento, "double_click") else None
+        actions = ActionChains(driver)
+        actions.double_click(elemento).perform()
+    time.sleep(0.3)
+    # Limpiar cualquier contenido previo y escribir
+    elemento.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.1)
+    elemento.send_keys(Keys.DELETE)
+    time.sleep(0.1)
+    elemento.send_keys(texto)
+    time.sleep(0.3)
+
+
+def esperar_carga_datos(driver, wait, timeout=120):
+    """
+    Espera que los datos carguen usando tres estrategias:
+    1. Aparición del texto 'Total venta neta USD'
+    2. Desaparición de spinners / loaders
+    3. Tiempo máximo de espera
+    Además, espera que cualquier overlay que pueda cubrir el botón desaparezca.
+    """
+    print("Esperando carga de datos...")
+    inicio = time.time()
+
+    # Estrategia 1: esperar el elemento de total de venta
+    try:
+        wait_largo = WebDriverWait(driver, timeout)
+        wait_largo.until(
+            EC.visibility_of_element_located((By.XPATH, XPATH_TOTAL_VENTA))
+        )
+        print("Datos cargados (se detectó 'Total venta neta USD').")
+    except Exception:
+        # Estrategia de respaldo: esperar que desaparezcan los spinners
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: len(d.find_elements(
+                    By.CSS_SELECTOR,
+                    ".k-loading-mask, .loading-spinner, .spinner, [class*='loading']"
+                )) == 0
+            )
+            tiempo = time.time() - inicio
+            print(f"Datos cargados (spinner desapareció en {tiempo:.1f}s).")
+        except Exception:
+            print(f"Advertencia: Se agotó el tiempo de espera ({timeout}s). Continuando de todas formas.")
+            return False
+
+    # Esperar adicionalmente a que desaparezcan posibles overlays (como el calendario)
+    try:
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        time.sleep(0.5)
+    except:
+        pass
+
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.invisibility_of_element_located((By.CSS_SELECTOR, ".k-overlay, .k-window, .k-popup"))
+        )
+    except:
+        pass
+
+    return True
+
+
+def navegar_y_verificar_reporte(driver, intentos=10, espera_entre_intentos=3):
+    """
+    Navega a la URL del reporte y verifica que el XPATH de comprobación
+    (h5 del módulo app-sale-payment-method) esté presente.
+    Si no lo detecta, reintenta la navegación hasta agotar los intentos.
+    Lanza una excepción si no logra acceder al reporte tras todos los intentos.
+    """
+    xpath_check = XPATH_VERIFICACION_REPORTE
+    for intento in range(1, intentos + 1):
+        print(f"  Intento {intento}/{intentos}: navegando a {URL_REPORTE} ...")
+        driver.get(URL_REPORTE)
+        time.sleep(espera_entre_intentos)
+        elementos = driver.find_elements(By.XPATH, xpath_check)
+        if elementos:
+            print(f"  Verificación exitosa: se detectó el módulo de formas de pago (intento {intento}).")
+            return
+        print(f"  El XPATH de verificación no está presente todavía. Reintentando...")
+    raise TimeoutError(
+        f"No se pudo acceder al reporte de formas de pago después de {intentos} intentos. "
+        "Verifica que la sesión esté activa y que la URL sea correcta."
+    )
+
+
+def obtener_archivo_descargado(patron, carpeta, timeout=60):
+    """
+    Espera a que aparezca un archivo que coincida con el patrón en la carpeta
+    y que no sea un archivo temporal (.crdownload / .tmp).
+    Devuelve la ruta completa del archivo o None.
+    """
+    print(f"Esperando descarga en: {carpeta}")
+    inicio = time.time()
+    while time.time() - inicio < timeout:
+        archivos = glob.glob(os.path.join(carpeta, patron))
+        # Filtrar archivos temporales de Chrome
+        archivos = [
+            a for a in archivos
+            if not a.endswith(".crdownload") and not a.endswith(".tmp")
+        ]
+        if archivos:
+            archivo = max(archivos, key=os.path.getmtime)
+            print(f"Archivo descargado: {archivo}")
+            return archivo
+        time.sleep(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Flujo principal
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 60)
+    print(f"Automatización Formas de Pago - {hoy.strftime('%d/%m/%Y')}")
+    print(f"Fecha del reporte (ayer): {ayer.strftime('%d/%m/%Y')}")
+    print(f"Nombre del archivo destino: {NOMBRE_ARCHIVO}.xlsx")
+    print("=" * 60)
+
+    # --- Configurar ChromeDriver ---
+    chrome_options = Options()
+    chrome_options.add_argument("--start-maximized")
+    prefs = {
+        "download.default_directory": CARPETA_DESCARGAS,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("ChromeDriver iniciado con webdriver-manager.")
+    except ImportError:
+        driver = webdriver.Chrome(options=chrome_options)
+        print("ChromeDriver iniciado desde el PATH del sistema.")
+
+    wait = WebDriverWait(driver, 30)
+    actions = ActionChains(driver)
+
+    try:
+        # -----------------------------------------------------------------------
+        # PASO 1-3: Login
+        # -----------------------------------------------------------------------
+        print("\n[PASO 1] Abriendo ERP...")
+        driver.get(URL_LOGIN)
+        driver.maximize_window()
+        time.sleep(2)
+
+        print("[PASO 2] Ingresando correo...")
+        campo_email = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_EMAIL)))
+        campo_email.clear()
+        campo_email.send_keys(EMAIL)
+        time.sleep(0.5)
+
+        print("[PASO 3] Ingresando contraseña...")
+        campo_password = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_PASSWORD)))
+        campo_password.clear()
+        campo_password.send_keys(PASSWORD)
+        campo_password.send_keys(Keys.RETURN)
+        time.sleep(3)
+
+        # -----------------------------------------------------------------------
+        # PASO 4: Navegar al reporte y verificar
+        # -----------------------------------------------------------------------
+        print("[PASO 4] Navegando al reporte de ventas por forma de pago...")
+        navegar_y_verificar_reporte(driver, intentos=10, espera_entre_intentos=3)
+
+        # -----------------------------------------------------------------------
+        # PASO 5: Ingresar fechas
+        # -----------------------------------------------------------------------
+        print(f"[PASO 5] Ingresando fecha 'Desde': {fecha_campo}")
+        campo_desde = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_DESDE)))
+        actions.double_click(campo_desde).perform()
+        time.sleep(0.4)
+        campo_desde.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.1)
+        campo_desde.send_keys(fecha_campo)
+        time.sleep(0.5)
+
+        print(f"[PASO 5] Ingresando fecha 'Hasta': {fecha_campo}")
+        try:
+            campo_hasta_container = wait.until(
+                EC.presence_of_element_located((By.XPATH, XPATH_HASTA))
+            )
+            campo_hasta = campo_hasta_container.find_element(By.TAG_NAME, "input")
+        except Exception:
+            campo_hasta = wait.until(
+                EC.element_to_be_clickable((By.XPATH, XPATH_HASTA + "/input"))
+            )
+
+        actions.double_click(campo_hasta).perform()
+        time.sleep(0.4)
+        campo_hasta.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.1)
+        campo_hasta.send_keys(fecha_campo)
+        time.sleep(0.5)
+
+        # -----------------------------------------------------------------------
+        # PASO 6: Seleccionar todas las sucursales (robusto)
+        # -----------------------------------------------------------------------
+        print("[PASO 6] Seleccionando todas las sucursales...")
+
+        # Cerrar posibles popups/overlays
+        try:
+            actions.send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.5)
+        except:
+            pass
+
+        # 1. Hacer clic en el input de sucursales para abrir el dropdown
+        input_sucursales = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_SUCURSALES_INPUT)))
+        driver.execute_script("arguments[0].click();", input_sucursales)
+        print("  Clic en el input de sucursales (dropdown abierto).")
+
+        # 2. Esperar a que el dropdown esté presente en el DOM
+        time.sleep(1)
+
+        # 3. Intentar localizar el popup del dropdown (puede ser un div con role='listbox' o una ul)
+        dropdown = None
+        selectores_popup = [
+            "//div[@role='listbox']",
+            "//ul[@role='listbox']",
+            "//div[contains(@class,'k-popup')]",
+            "//ul[contains(@class,'k-list')]"
+        ]
+        for selector in selectores_popup:
+            try:
+                dropdown = WebDriverWait(driver, 2).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
+                )
+                print(f"  Dropdown detectado con selector: {selector}")
+                break
+            except:
+                continue
+
+        if dropdown:
+            # Buscar la opción "Seleccionar todos" dentro del dropdown
+            opcion_select_todos = None
+            textos_buscar = ["seleccionar todos", "seleccionar todas", "todos", "todas"]
+            for texto in textos_buscar:
+                try:
+                    # XPath que busca cualquier elemento dentro del dropdown que contenga el texto (insensible a mayúsculas)
+                    opcion_select_todos = dropdown.find_element(By.XPATH, f".//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜ', 'abcdefghijklmnopqrstuvwxyzáéíóúü'), '{texto}')]")
+                    print(f"  Opción encontrada con texto: {texto}")
+                    break
+                except:
+                    continue
+            if opcion_select_todos:
+                # Hacer clic en la opción (o en su checkbox si existe)
+                try:
+                    checkbox = opcion_select_todos.find_element(By.XPATH, ".//input[@type='checkbox']")
+                    driver.execute_script("arguments[0].click();", checkbox)
+                except:
+                    driver.execute_script("arguments[0].click();", opcion_select_todos)
+                print("  Clic en 'Seleccionar todos'.")
+                time.sleep(0.5)
+            else:
+                print("  No se encontró 'Seleccionar todos'. Seleccionando todas las opciones individualmente...")
+                # Fallback: seleccionar todas las opciones del dropdown mediante checkboxes
+                # Buscar todos los checkboxes dentro del dropdown
+                checkboxes = dropdown.find_elements(By.XPATH, ".//input[@type='checkbox']")
+                if not checkboxes:
+                    # Si no hay checkboxes, buscar las opciones y dentro de ellas los checkboxes
+                    opciones = dropdown.find_elements(By.XPATH, ".//li")
+                    if not opciones:
+                        opciones = dropdown.find_elements(By.XPATH, ".//div[contains(@class,'k-item')]")
+                    checkboxes = []
+                    for op in opciones:
+                        try:
+                            cb = op.find_element(By.XPATH, ".//input[@type='checkbox']")
+                            checkboxes.append(cb)
+                        except:
+                            # Si no hay checkbox, usar la propia opción
+                            checkboxes.append(op)
+                total_checkboxes = len(checkboxes)
+                print(f"  Total de checkboxes/opciones encontradas: {total_checkboxes}")
+
+                # Marcar todos los checkboxes mediante JavaScript (sin clic)
+                for i, cb in enumerate(checkboxes, 1):
+                    driver.execute_script("arguments[0].checked = true; arguments[0].dispatchEvent(new Event('change'));", cb)
+                    # También intentar agregar clase visual 'k-state-selected' al contenedor padre
+                    try:
+                        parent = cb.find_element(By.XPATH, "..")
+                        driver.execute_script("arguments[0].classList.add('k-state-selected');", parent)
+                    except:
+                        pass
+                    print(f"  Opción {i} marcada.")
+                    time.sleep(0.05)  # pausa mínima
+
+                # Verificar que se hayan marcado todas (opcional)
+                time.sleep(0.5)
+                print(f"  Se marcaron {total_checkboxes} sucursales.")
+                if total_checkboxes != 40:
+                    print(f"  ADVERTENCIA: Se esperaban 40 sucursales, pero se encontraron {total_checkboxes}. Verificar.")
+        else:
+            # Si no se detecta el dropdown, usar el método de selección individual con teclado
+            print("  No se detectó el dropdown. Usando método alternativo con teclado...")
+            try:
+                # Enviar flecha abajo repetidamente para seleccionar todas
+                for _ in range(50):  # Número suficiente para cubrir 40 sucursales
+                    input_sucursales.send_keys(Keys.ARROW_DOWN)
+                    time.sleep(0.1)
+                    input_sucursales.send_keys(Keys.RETURN)
+                    time.sleep(0.1)
+                print("  Selección por teclado completada.")
+            except Exception as e:
+                print(f"  Error en método de teclado: {e}")
+
+        # Cerrar el dropdown (clic fuera)
+        try:
+            driver.find_element(By.TAG_NAME, "body").click()
+        except:
+            pass
+        time.sleep(0.5)
+
+        print("  Selección de sucursales completada.")
+
+        # -----------------------------------------------------------------------
+        # PASO 7: Buscar y esperar carga
+        # -----------------------------------------------------------------------
+        print("[PASO 7] Haciendo clic en 'Buscar'...")
+        boton_buscar = wait.until(EC.element_to_be_clickable((By.XPATH, XPATH_BUSCAR)))
+        boton_buscar.click()
+
+        esperar_carga_datos(driver, wait, timeout=120)
+
+        # -----------------------------------------------------------------------
+        # PASO 8: Exportar a Excel con espera suficiente
+        # -----------------------------------------------------------------------
+        print("[PASO 8] Haciendo clic en 'Exportar a Excel'...")
+        boton_exportar = wait.until(EC.presence_of_element_located((By.XPATH, XPATH_EXPORTAR)))
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", boton_exportar)
+        time.sleep(1)
+        try:
+            actions.send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.5)
+        except:
+            pass
+        driver.execute_script("arguments[0].click();", boton_exportar)
+        print("Descarga iniciada, esperando 10 segundos para que se complete...")
+        time.sleep(10)
+
+        # -----------------------------------------------------------------------
+        # PASO 9: Renombrar el archivo
+        # -----------------------------------------------------------------------
+        archivo_descargado = obtener_archivo_descargado("*.xlsx", CARPETA_DESCARGAS, timeout=60)
+        if not archivo_descargado:
+            archivo_descargado = obtener_archivo_descargado("*.xls", CARPETA_DESCARGAS, timeout=10)
+
+        if not archivo_descargado:
+            raise FileNotFoundError(
+                "No se encontró el archivo descargado. Verifica que la descarga se haya completado."
+            )
+
+        extension = os.path.splitext(archivo_descargado)[1]
+        nuevo_nombre = NOMBRE_ARCHIVO + extension
+        ruta_renombrado = os.path.join(CARPETA_DESCARGAS, nuevo_nombre)
+
+        if os.path.exists(ruta_renombrado):
+            os.remove(ruta_renombrado)
+        os.rename(archivo_descargado, ruta_renombrado)
+        print(f"Archivo renombrado a: {ruta_renombrado}")
+
+        # -----------------------------------------------------------------------
+        # PASO 10: Mover a carpeta destino
+        # -----------------------------------------------------------------------
+        print(f"[PASO 10] Moviendo archivo a: {CARPETA_DESTINO}")
+        os.makedirs(CARPETA_DESTINO, exist_ok=True)
+        ruta_final = os.path.join(CARPETA_DESTINO, nuevo_nombre)
+
+        if os.path.exists(ruta_final):
+            os.remove(ruta_final)
+        shutil.move(ruta_renombrado, ruta_final)
+        print(f"Archivo movido exitosamente a: {ruta_final}")
+
+        print("\n" + "=" * 60)
+        print("PROCESO COMPLETADO CON ÉXITO")
+        print(f"Archivo: {nuevo_nombre}")
+        print(f"Ubicación: {CARPETA_DESTINO}")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        raise
+
+    finally:
+        time.sleep(2)
+        driver.quit()
+        print("Navegador cerrado.")
+
+
+if __name__ == "__main__":
+    main()
