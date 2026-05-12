@@ -1,0 +1,709 @@
+"""
+Automatización de descarga de reportes de Cuentas por Pagar - ERP Riomarket
+============================================================================
+Versión ultra robusta con manejo de:
+- Ventana de confirmación de exportación ("Sí").
+- Reintentos y recuperación ante errores de conexión (MaxRetryError).
+- Esperas infinitas y sincronización mejorada.
+- Refresco automático (F5) si la carga posterior a "Buscar" excede el tiempo límite.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List
+
+from selenium import webdriver
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    _USE_WDM = True
+except ImportError:
+    _USE_WDM = False
+
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+
+URL_LOGIN = "LinkPaginaWeb"
+URL_MODULO = "ModuloPaginaWeb"
+
+USUARIO = "usuario"
+CONTRASENA = "clave"
+
+CARPETA_DESTINO = r"CarpetaDestino"
+CARPETA_DESCARGA = r"CarpetaDeDescargas"
+
+TIMEOUT_CORTO = 30
+TIMEOUT_MEDIO = 120
+TIMEOUT_LARGO = 1800  # 30 minutos para operaciones largas
+ESPERA_DESCARGA = 180  # 3 minutos para descarga
+
+MAX_REINTENTOS = 3  # Reintentos por viaje
+MAX_REINTENTOS_DRIVER = 2  # Reintentos de reinicio de driver
+
+# NUEVO: Tiempo máximo para la carga de la vista previa después de Buscar
+TIMEOUT_CARGA_VISTA_PREVIA = 1080  # 18 minutos
+
+# XPATH del spinner de carga (proporcionado)
+XP_SPINNER = "/html/body/app-root/app-layout/app-loading/div/div/div/p-progressspinner/div/svg"
+# Texto de carga adicional
+XP_TEXTO_CARGA = "//*[contains(text(),'Por favor espere')]"
+# Indicador de que la tabla está lista (puede ser el texto "Mostrando" o la presencia de una celda)
+XP_TABLA_LISTA = "//*[contains(text(),'Mostrando') or contains(text(),'registros')]"
+# Botón "Sí" para confirmar la exportación (proporcionado)
+XP_BOTON_SI = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/p-confirmdialog/div/div/div[3]/button[2]"
+
+# =============================================================================
+# DEFINICIÓN DE VIAJES (por trimestres)
+# =============================================================================
+
+@dataclass
+class Viaje:
+    nombre: str
+    fecha_inicio: datetime
+    fecha_fin: datetime
+
+def construir_viajes() -> List[Viaje]:
+    hoy = datetime.now()
+    viajes = []
+    
+    # Trimestres 2024
+    viajes.append(Viaje("2024_Q1", datetime(2024, 1, 1), datetime(2024, 3, 31)))
+    viajes.append(Viaje("2024_Q2", datetime(2024, 4, 1), datetime(2024, 6, 30)))
+    viajes.append(Viaje("2024_Q3", datetime(2024, 7, 1), datetime(2024, 9, 30)))
+    viajes.append(Viaje("2024_Q4", datetime(2024, 10, 1), datetime(2024, 12, 31)))
+    
+    # Trimestres 2025
+    viajes.append(Viaje("2025_Q1", datetime(2025, 1, 1), datetime(2025, 3, 31)))
+    viajes.append(Viaje("2025_Q2", datetime(2025, 4, 1), datetime(2025, 6, 30)))
+    viajes.append(Viaje("2025_Q3", datetime(2025, 7, 1), datetime(2025, 9, 30)))
+    viajes.append(Viaje("2025_Q4", datetime(2025, 10, 1), datetime(2025, 12, 31)))
+    
+    # Año 2026 hasta hoy
+    viajes.append(Viaje("2026_Q1", datetime(2026, 1, 1), datetime(2026, 3, 31)))
+    viajes.append(Viaje("2026_Q2_hasta_hoy", datetime(2026, 4, 1), hoy))
+    
+    return viajes
+
+# =============================================================================
+# XPATHS (todos los que ya funcionaban)
+# =============================================================================
+
+XP_LOGIN_USER = "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[1]/input"
+XP_LOGIN_PASS = "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/div[2]/input"
+XP_LOGIN_BTN = "/html/body/app-root/app-login/div/div/div[2]/div/div[2]/form/button"
+
+XP_ESTATUS = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[8]/p-multiselect/div/div[2]/div"
+XP_ESTATUS_OPCIONES = [
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[8]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[1]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[8]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[2]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[8]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[3]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[8]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[4]/li/div/div",
+]
+
+XP_TIPO_DOC = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[9]/p-multiselect/div/div[2]/div"
+XP_TIPO_DOC_TODOS = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[9]/p-multiselect/div/div[4]/div[1]/div[1]/div[2]"
+
+XP_CLAS_PROV = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[11]/p-multiselect/div/div[2]/div"
+XP_CLAS_PROV_OPCIONES = [
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[11]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[3]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[11]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[4]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[11]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[5]/li/div/div",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[11]/p-multiselect/div/div[4]/div[2]/ul/p-multiselectitem[7]/li/div/div",
+]
+
+XP_TIPO_RANGO = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[12]/p-dropdown/div/span"
+XP_TIPO_RANGO_DIFERENTE = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[12]/p-dropdown/div/div[3]/div[2]/ul/p-dropdownitem[7]/li/span[1]"
+
+XP_FECHA_FILTRAR = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[14]/p-dropdown/div/span"
+XP_FECHA_FILTRAR_CONTABILIZACION = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[14]/p-dropdown/div/div[3]/div[2]/ul/p-dropdownitem[2]/li/span[1]"
+
+# Calendario
+XP_FECHA_INICIO_CAMPO = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/button/span[1]"
+XP_FECHA_FIN_CAMPO = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[16]/p-calendar/span/button/span[1]"
+
+XP_FECHA_INICIO_BTN_ANIO = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[1]/div/div[1]/div/button[2]"
+XP_FECHA_FIN_BTN_ANIO = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[16]/p-calendar/span/div/div[1]/div/div[1]/div/button[2]"
+
+# Contenedores
+XP_FECHA_INICIO_CONTENEDOR = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div"
+XP_FECHA_FIN_CONTENEDOR = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[16]/p-calendar/span/div"
+
+MESES_INICIO = [
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[1]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[2]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[3]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[4]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[5]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[6]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[7]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[8]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[9]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[10]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[11]",
+    "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[1]/div/div[15]/p-calendar/span/div/div[2]/span[12]",
+]
+MESES_FIN = [xp.replace("div[15]", "div[16]") for xp in MESES_INICIO]
+
+XP_BUSCAR = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[2]/div/button[2]/span[2]"
+XP_EXPORTAR = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[2]/div/p-splitbutton/div/button[2]/span[1]"
+XP_EXPORTAR_EXCEL = "/html/body/app-root/app-layout/div/div/div[1]/app-payment-account/div[1]/div[2]/app-payment-account-filter/div[2]/div/p-splitbutton/div/p-tieredmenu/div/p-tieredmenusub/ul/li/a/span[2]"
+
+# =============================================================================
+# FUNCIONES DE GESTIÓN DE DRIVER Y ERRORES
+# =============================================================================
+
+def construir_driver() -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "download.default_directory": CARPETA_DESCARGA,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    })
+    if _USE_WDM:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=opts)
+    else:
+        driver = webdriver.Chrome(options=opts)
+    
+    # Script para ocultar la automatización
+    script = """
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+    });
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    """
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
+    
+    driver.set_page_load_timeout(TIMEOUT_LARGO)
+    driver.set_script_timeout(TIMEOUT_LARGO)
+    try:
+        driver.command_executor._client.timeout = 600
+    except:
+        pass
+    return driver
+
+def verificar_driver(driver):
+    try:
+        driver.current_url
+        return True
+    except WebDriverException:
+        return False
+
+def reiniciar_driver(driver_actual, destino_dir, carpeta_descarga) -> webdriver.Chrome:
+    print("[*] Reiniciando el driver completamente...")
+    try:
+        driver_actual.quit()
+    except:
+        pass
+    time.sleep(5)
+    nuevo_driver = construir_driver()
+    login(nuevo_driver)
+    ir_al_modulo(nuevo_driver)
+    aplicar_filtros_fijos(nuevo_driver)
+    return nuevo_driver
+
+def navegar_con_reintentos(driver, url, max_reintentos=3):
+    """
+    Navega a una URL con reintentos y, en caso de error de conexión,
+    reinicia el driver y vuelve a loguearse.
+    """
+    for intento in range(1, max_reintentos + 1):
+        try:
+            driver.get(url)
+            return True
+        except (TimeoutException, WebDriverException, ConnectionError) as e:
+            print(f"[!] Error al navegar a {url} (intento {intento}/{max_reintentos}): {type(e).__name__}")
+            if intento == max_reintentos:
+                raise
+            print("[*] Reintentando navegación después de 10 segundos...")
+            time.sleep(10)
+            # Si el error es de conexión (driver muerto), lo reiniciamos
+            if isinstance(e, ConnectionError) or "WinError 10061" in str(e) or "MaxRetryError" in str(e):
+                print("[!] Conexión perdida, reiniciando el driver...")
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = construir_driver()
+                login(driver)
+                ir_al_modulo(driver)
+                aplicar_filtros_fijos(driver)
+    return False
+
+# =============================================================================
+# ESPERA INTELIGENTE (con límite de tiempo para la carga posterior a Buscar)
+# =============================================================================
+
+def esperar_fin_carga(driver, mensaje_extra: str = "", timeout_total: int = TIMEOUT_CARGA_VISTA_PREVIA) -> None:
+    """
+    Espera a que desaparezcan spinner y texto 'Por favor espere', con un tiempo máximo global.
+    Luego espera a que el botón Exportar sea clickeable.
+    Finalmente, espera a que aparezca un indicador de que la tabla está lista
+    (texto 'Mostrando' o presencia de filas), o fuerza una pausa adicional de 8 segundos.
+    
+    Si se supera el timeout_total, lanza TimeoutException.
+    """
+    print(f"[*] Esperando a que termine la carga (spinner, texto y botón Exportar)... {mensaje_extra}")
+    inicio = time.time()
+    
+    # 1. Esperar indefinidamente o hasta timeout a que desaparezca el spinner
+    while True:
+        if time.time() - inicio > timeout_total:
+            raise TimeoutException(f"Timeout esperando desaparición del spinner después de {timeout_total} segundos.")
+        if not verificar_driver(driver):
+            raise WebDriverException("El driver ha perdido comunicación con el navegador.")
+        try:
+            spinner = driver.find_element(By.XPATH, XP_SPINNER)
+            if not spinner.is_displayed():
+                break
+        except:
+            break
+        time.sleep(1)
+    
+    # 2. Esperar indefinidamente o hasta timeout a que desaparezca el texto "Por favor espere"
+    while True:
+        if time.time() - inicio > timeout_total:
+            raise TimeoutException(f"Timeout esperando desaparición del texto de carga después de {timeout_total} segundos.")
+        if not verificar_driver(driver):
+            raise WebDriverException("El driver ha perdido comunicación con el navegador.")
+        try:
+            texto = driver.find_element(By.XPATH, XP_TEXTO_CARGA)
+            if not texto.is_displayed():
+                break
+        except:
+            break
+        time.sleep(1)
+    
+    # 3. Esperar a que el botón Exportar sea clickeable (con timeout muy alto)
+    try:
+        WebDriverWait(driver, TIMEOUT_LARGO).until(
+            EC.element_to_be_clickable((By.XPATH, XP_EXPORTAR))
+        )
+    except TimeoutException as e:
+        raise TimeoutException(f"El botón Exportar no se volvió clickeable después de {TIMEOUT_LARGO} segundos.") from e
+    
+    # 4. Esperar a que aparezca algún indicador de que la tabla está cargada
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.XPATH, XP_TABLA_LISTA))
+        )
+        print("[*] Tabla o indicador de carga detectado.")
+    except TimeoutException:
+        print("[!] No se encontró indicador de tabla lista; se aplicará una pausa adicional de 8 segundos.")
+        time.sleep(8)
+    
+    print("[*] Carga completada. Pausa de 2 segundos para estabilizar pantalla...")
+    time.sleep(2)
+    sys.stdout.flush()
+
+# =============================================================================
+# FUNCIONES AUXILIARES (sin cambios)
+# =============================================================================
+
+def esperar(driver, xpath: str, timeout: int = TIMEOUT_CORTO) -> WebElement:
+    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xpath)))
+
+def esperar_clickable(driver, xpath: str, timeout: int = TIMEOUT_CORTO) -> WebElement:
+    return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+
+def click_seguro(driver, xpath: str, timeout: int = TIMEOUT_CORTO) -> None:
+    fin = time.time() + timeout
+    while time.time() < fin:
+        if not verificar_driver(driver):
+            raise WebDriverException("Driver no responde")
+        try:
+            el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+            try:
+                el.click()
+            except:
+                ActionChains(driver).move_to_element(el).click().perform()
+            return
+        except Exception:
+            try:
+                el = driver.find_element(By.XPATH, xpath)
+                driver.execute_script("arguments[0].click();", el)
+                return
+            except:
+                pass
+        time.sleep(0.5)
+    raise TimeoutException(f"No se pudo hacer click en {xpath}")
+
+def manejar_confirmacion_exportacion(driver):
+    """Verifica si aparece la ventana de confirmación de exportación y hace clic en 'Sí'."""
+    try:
+        # Esperar un momento corto a que aparezca el diálogo
+        boton_si = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.XPATH, XP_BOTON_SI))
+        )
+        print("[!] Ventana de confirmación de exportación detectada. Haciendo clic en 'Sí'...")
+        boton_si.click()
+        time.sleep(1)
+        return True
+    except TimeoutException:
+        # No apareció el diálogo, seguir normalmente
+        return False
+
+# =============================================================================
+# LOGIN, MÓDULO, FILTROS, SELECCIÓN DE FECHAS (sin cambios)
+# =============================================================================
+
+def login(driver) -> None:
+    print("[*] Cargando página de login...")
+    navegar_con_reintentos(driver, URL_LOGIN)
+    driver.maximize_window()
+    usuario = esperar(driver, XP_LOGIN_USER, TIMEOUT_MEDIO)
+    usuario.send_keys(USUARIO)
+    password = esperar(driver, XP_LOGIN_PASS, TIMEOUT_MEDIO)
+    password.send_keys(CONTRASENA)
+    password.send_keys(Keys.ENTER)
+    print("[*] Login enviado, esperando sesión...")
+    WebDriverWait(driver, TIMEOUT_MEDIO).until(EC.invisibility_of_element_located((By.XPATH, XP_LOGIN_USER)))
+    WebDriverWait(driver, TIMEOUT_MEDIO).until(EC.presence_of_element_located((By.TAG_NAME, "app-layout")))
+    time.sleep(2)
+    print("[*] Sesión establecida correctamente.")
+    sys.stdout.flush()
+
+def ir_al_modulo(driver) -> None:
+    print(f"[*] Navegando al módulo: {URL_MODULO}")
+    navegar_con_reintentos(driver, URL_MODULO)
+    esperar(driver, XP_ESTATUS, TIMEOUT_MEDIO)
+    print("[*] Módulo cargado correctamente.")
+    sys.stdout.flush()
+
+def aplicar_filtros_fijos(driver) -> None:
+    print("[*] Aplicando filtro: Estatus (todas las opciones)")
+    click_seguro(driver, XP_ESTATUS)
+    for xp in XP_ESTATUS_OPCIONES:
+        click_seguro(driver, xp)
+    click_seguro(driver, XP_ESTATUS)
+
+    print("[*] Aplicando filtro: Tipo documento operación (todas)")
+    click_seguro(driver, XP_TIPO_DOC)
+    click_seguro(driver, XP_TIPO_DOC_TODOS)
+    click_seguro(driver, XP_TIPO_DOC)
+
+    print("[*] Aplicando filtro: Clasificación del proveedor")
+    click_seguro(driver, XP_CLAS_PROV)
+    for xp in XP_CLAS_PROV_OPCIONES:
+        click_seguro(driver, xp)
+    click_seguro(driver, XP_CLAS_PROV)
+
+    # El filtro "Tipo de rango -> Diferente de <>" ha sido eliminado.
+    
+    print("[*] Aplicando filtro: Fecha a filtrar -> Fecha de contabilización")
+    click_seguro(driver, XP_FECHA_FILTRAR)
+    click_seguro(driver, XP_FECHA_FILTRAR_CONTABILIZACION)
+    sys.stdout.flush()
+
+def seleccionar_fecha(driver, xp_campo, xp_btn_anio, lista_meses, fecha):
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    print(f"    -> Seleccionando fecha {fecha_str}")
+    sys.stdout.flush()
+
+    click_seguro(driver, xp_campo)
+    time.sleep(0.5)
+
+    click_seguro(driver, xp_btn_anio)
+    time.sleep(0.5)
+
+    if lista_meses is MESES_INICIO:
+        contenedor = XP_FECHA_INICIO_CONTENEDOR
+    else:
+        contenedor = XP_FECHA_FIN_CONTENEDOR
+
+    indice_anio = fecha.year - 2019
+    xpath_anio = f"{contenedor}/div[2]/span[{indice_anio}]"
+    click_seguro(driver, xpath_anio)
+    time.sleep(0.5)
+    print(f"    -> Año {fecha.year} seleccionado")
+
+    indice_mes = fecha.month - 1
+    xp_mes = lista_meses[indice_mes]
+    click_seguro(driver, xp_mes)
+    time.sleep(0.5)
+    print(f"    -> Mes {fecha.strftime('%B')} seleccionado")
+
+    xpath_dia = f"{contenedor}//td[not(contains(@class, 'p-datepicker-other-month'))]//span[text()='{fecha.day}']"
+    click_seguro(driver, xpath_dia)
+    time.sleep(0.5)
+    print(f"    -> Día {fecha.day} seleccionado")
+
+# =============================================================================
+# DESCARGA Y RENOMBRADO (con manejo de confirmación y esperas mejoradas)
+# =============================================================================
+
+def esperar_descarga(timeout: int = ESPERA_DESCARGA) -> Path:
+    fecha_hoy = datetime.now().date()
+    print(f"[*] Monitoreando descargas en: {CARPETA_DESCARGA}")
+    sys.stdout.flush()
+
+    inicio = time.time()
+    while time.time() - inicio < timeout:
+        archivos = [f for f in os.listdir(CARPETA_DESCARGA) if f.lower().endswith(('.xlsx', '.xls')) and not f.endswith('.crdownload')]
+        for archivo in archivos:
+            ruta = Path(CARPETA_DESCARGA) / archivo
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(ruta)).date()
+                if mtime == fecha_hoy and os.path.getsize(ruta) > 0:
+                    time.sleep(2)
+                    if os.path.getsize(ruta) > 0:
+                        print(f"[*] Archivo detectado: {archivo}")
+                        return ruta
+            except Exception:
+                continue
+        time.sleep(1)
+    raise TimeoutException("No se detectó ningún archivo Excel descargado hoy dentro del tiempo esperado.")
+
+def mover_y_renombrar(origen: Path, destino_dir: str) -> Path:
+    Path(destino_dir).mkdir(parents=True, exist_ok=True)
+    fecha_actual = datetime.now().strftime("%d%m%Y")
+    nombre_base = f"Cuentas_X_Pagar_{fecha_actual}.xlsx"
+    destino = Path(destino_dir) / nombre_base
+    if destino.exists():
+        contador = 1
+        while destino.exists():
+            destino = Path(destino_dir) / f"Cuentas_X_Pagar_{fecha_actual}_{contador}.xlsx"
+            contador += 1
+    shutil.move(str(origen), str(destino))
+    for _ in range(10):
+        if destino.exists() and destino.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+    else:
+        raise IOError(f"El archivo destino {destino} no se creó correctamente o está vacío.")
+    return destino
+
+def buscar_y_exportar(driver, destino_dir: str, es_ultimo_viaje: bool = False) -> Path:
+    print("[*] Click en Buscar...")
+    click_seguro(driver, XP_BUSCAR)
+    sys.stdout.flush()
+
+    esperar_fin_carga(driver, mensaje_extra="(después de Buscar)")
+
+    if es_ultimo_viaje:
+        print("[*] Último viaje detectado. Espera adicional de 5 segundos...")
+        time.sleep(5)
+
+    print("[*] Click en Exportar...")
+    click_seguro(driver, XP_EXPORTAR)
+    sys.stdout.flush()
+
+    # Manejar la ventana de confirmación que puede aparecer inmediatamente después
+    manejar_confirmacion_exportacion(driver)
+
+    WebDriverWait(driver, TIMEOUT_MEDIO).until(
+        EC.element_to_be_clickable((By.XPATH, XP_EXPORTAR_EXCEL))
+    )
+    print("[*] Click en opción Excel...")
+    click_seguro(driver, XP_EXPORTAR_EXCEL)
+    sys.stdout.flush()
+
+    # Puede aparecer otra confirmación después de hacer clic en Excel
+    manejar_confirmacion_exportacion(driver)
+
+    # Esperar a que desaparezca cualquier spinner residual después del clic
+    for _ in range(30):
+        try:
+            spinner = driver.find_element(By.XPATH, XP_SPINNER)
+            if not spinner.is_displayed():
+                break
+        except:
+            break
+        time.sleep(1)
+    time.sleep(2)
+
+    archivo_descargado = esperar_descarga()
+    print(f"[*] Archivo descargado: {archivo_descargado}")
+
+    destino = mover_y_renombrar(archivo_descargado, destino_dir)
+    print(f"[*] Archivo guardado como: {destino}")
+
+    # Esperar a que no quede ningún indicador de carga
+    print("[*] Verificando que no queden indicadores de carga residuales...")
+    for _ in range(10):
+        try:
+            spinner = driver.find_element(By.XPATH, XP_SPINNER)
+            if spinner.is_displayed():
+                print("    Aún hay spinner, esperando...")
+                time.sleep(1)
+                continue
+        except:
+            pass
+        try:
+            texto = driver.find_element(By.XPATH, XP_TEXTO_CARGA)
+            if texto.is_displayed():
+                print("    Aún hay texto de carga, esperando...")
+                time.sleep(1)
+                continue
+        except:
+            pass
+        break
+
+    # Pausa final para estabilizar la página
+    print("[*] Pausa de 15 segundos para que la página se estabilice completamente...")
+    time.sleep(15)
+    return destino
+
+# =============================================================================
+# FLUJO PRINCIPAL CON REINTENTOS, REFRESCO AUTOMÁTICO Y SINCRONIZACIÓN
+# =============================================================================
+
+def ejecutar_viaje(driver, viaje: Viaje, destino_dir: str, es_ultimo: bool = False) -> None:
+    for intento in range(1, MAX_REINTENTOS + 1):
+        print(f"\n{'='*70}\nVIAJE: {viaje.nombre} -> {viaje.fecha_inicio.strftime('%d/%m/%Y')} a {viaje.fecha_fin.strftime('%d/%m/%Y')} (Intento {intento}/{MAX_REINTENTOS})")
+        print('='*70)
+        sys.stdout.flush()
+
+        try:
+            if not verificar_driver(driver):
+                print("[!] El driver parece muerto, reiniciando...")
+                driver = reiniciar_driver(driver, destino_dir, CARPETA_DESCARGA)
+
+            seleccionar_fecha(
+                driver,
+                XP_FECHA_INICIO_CAMPO,
+                XP_FECHA_INICIO_BTN_ANIO,
+                MESES_INICIO,
+                viaje.fecha_inicio
+            )
+
+            seleccionar_fecha(
+                driver,
+                XP_FECHA_FIN_CAMPO,
+                XP_FECHA_FIN_BTN_ANIO,
+                MESES_FIN,
+                viaje.fecha_fin
+            )
+
+            # Sub-bucle para manejar refrescos (F5) ante timeouts de carga posterior a Buscar
+            max_refrescos = 3
+            for refresh_intento in range(1, max_refrescos + 1):
+                try:
+                    buscar_y_exportar(driver, destino_dir, es_ultimo)
+                    break  # Éxito, salir del sub-bucle
+                except TimeoutException as e:
+                    print(f"[!] Timeout en carga de vista previa (refresh intento {refresh_intento}/{max_refrescos}): {e}")
+                    if refresh_intento == max_refrescos:
+                        # Agotamos los refrescos, relanzamos para que el reintento global (reinicio de driver) actúe
+                        raise
+                    print("[*] Refrescando la página (F5) para restablecer la conexión...")
+                    driver.refresh()
+                    time.sleep(5)
+                    # Esperar a que la página recargue y el módulo esté presente
+                    WebDriverWait(driver, TIMEOUT_MEDIO).until(
+                        EC.presence_of_element_located((By.XPATH, XP_ESTATUS))
+                    )
+                    # Re-aplicar filtros fijos y las fechas del viaje actual
+                    aplicar_filtros_fijos(driver)
+                    seleccionar_fecha(
+                        driver,
+                        XP_FECHA_INICIO_CAMPO,
+                        XP_FECHA_INICIO_BTN_ANIO,
+                        MESES_INICIO,
+                        viaje.fecha_inicio
+                    )
+                    seleccionar_fecha(
+                        driver,
+                        XP_FECHA_FIN_CAMPO,
+                        XP_FECHA_FIN_BTN_ANIO,
+                        MESES_FIN,
+                        viaje.fecha_fin
+                    )
+                    # Continúa con el siguiente intento de refresh
+
+            print(f"[OK] Viaje {viaje.nombre} completado exitosamente en el intento {intento}.\n")
+            sys.stdout.flush()
+            # Pausa aumentada a 10 segundos antes del siguiente viaje
+            print("[*] Esperando 10 segundos para resetear la interfaz antes del próximo viaje...")
+            time.sleep(10)
+            return
+
+        except (TimeoutException, WebDriverException, ConnectionError, Exception) as e:
+            error_tipo = type(e).__name__
+            error_msg = str(e) if str(e) else "(mensaje vacío)"
+            print(f"[ERROR] Falló el viaje {viaje.nombre} en intento {intento}/{MAX_REINTENTOS}: {error_tipo} - {error_msg}")
+
+            if intento < MAX_REINTENTOS:
+                print("[*] Reintentando con reinicio completo del driver...")
+                try:
+                    driver = reiniciar_driver(driver, destino_dir, CARPETA_DESCARGA)
+                except Exception as reinicio_error:
+                    print(f"[!] Error al reiniciar driver: {reinicio_error}")
+                    time.sleep(30)
+                    driver = construir_driver()
+                    login(driver)
+                    ir_al_modulo(driver)
+                    aplicar_filtros_fijos(driver)
+                time.sleep(15)
+            else:
+                print(f"[ERROR] Se agotaron los {MAX_REINTENTOS} intentos para el viaje {viaje.nombre}. Saltando al siguiente viaje.\n")
+                raise
+
+def main() -> None:
+    Path(CARPETA_DESTINO).mkdir(parents=True, exist_ok=True)
+    Path(CARPETA_DESCARGA).mkdir(parents=True, exist_ok=True)
+
+    driver = construir_driver()
+    try:
+        login(driver)
+        ir_al_modulo(driver)
+        aplicar_filtros_fijos(driver)
+        viajes = construir_viajes()
+        for idx, viaje in enumerate(viajes):
+            es_ultimo = (idx == len(viajes) - 1)
+            try:
+                ejecutar_viaje(driver, viaje, CARPETA_DESTINO, es_ultimo)
+            except Exception as e:
+                print(f"[ERROR] No se pudo completar el viaje {viaje.nombre} después de {MAX_REINTENTOS} intentos: {e}")
+                try:
+                    driver = reiniciar_driver(driver, CARPETA_DESTINO, CARPETA_DESCARGA)
+                except:
+                    driver = construir_driver()
+                    login(driver)
+                    ir_al_modulo(driver)
+                    aplicar_filtros_fijos(driver)
+                continue
+        print("\n[OK] Proceso finalizado.")
+    finally:
+        driver.quit()
+
+if __name__ == "__main__":
+    main()
